@@ -183,6 +183,7 @@ def train_nanochat(
     hf_repo: str = "",
     save_every: int = 1000,
     window_pattern: str = "L",
+    data_shards: int = 32,
     extra_args: str = "",
 ) -> dict:
     """
@@ -194,6 +195,9 @@ def train_nanochat(
     save_every     : checkpoint interval in steps (persisted to the Volume)
     window_pattern : attention window pattern; "L" = full causal context
                      (our experiment default), "SSSL" = upstream sliding-window
+    data_shards    : pretraining shards to ensure downloaded (d12 with 8 shards
+                     repeated data 4x -> use ~32+ so epoch stays ~1; bigger
+                     depths need more, see runs/speedrun.sh)
     extra_args     : extra CLI flags, e.g. "--device-batch-size=8"
     """
     os.chdir(REPO_DIR)
@@ -220,15 +224,19 @@ def train_nanochat(
         f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\""
     )
 
-    # One-time prerequisites (persisted on the Volume after first run).
+    # Data shards: always top up to data_shards (incremental — already-present
+    # shards are skipped; persisted on the Volume). The first run with only 8
+    # shards produced 4 epochs of data repetition for d12; avoid that.
+    _run_streamed(f"{python} -m nanochat.dataset -n {data_shards}")
+
+    # Tokenizer: one-time (persisted on the Volume).
     # NOTE: mirror the exact commands from your fork's runs/speedrun.sh if
     # these ever drift from upstream.
     tokenizer_dir = Path(CACHE_DIR) / "tokenizer"
     if not tokenizer_dir.exists():
-        print("[modal_train] no tokenizer found — running one-time data+tokenizer setup")
-        _run_streamed(f"{python} -m nanochat.dataset -n 8")
+        print("[modal_train] no tokenizer found — training tokenizer (one-time)")
         _run_streamed(f"{python} -m scripts.tok_train")
-        ckpt_vol.commit()
+    ckpt_vol.commit()
 
     # NOTE: the trailing '--' separator is torchrun syntax only; plain python
     # argparse chokes on it (exit 2).
@@ -266,17 +274,19 @@ def train_nanochat(
         if not token:
             print("[modal_train] WARNING: HF_TOKEN empty, skipping upload")
         else:
-            # nanochat saves under ~/.cache/nanochat/checkpoints/<model-tag>/
-            ckpt_dir = Path(CACHE_DIR) / "checkpoints" / run_name
-            if not ckpt_dir.exists():
-                ckpt_dir = Path(CACHE_DIR) / "checkpoints"  # fallback: everything
+            # nanochat saves under ~/.cache/nanochat/base_checkpoints/<model-tag>/
+            ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_name
             api = HfApi(token=token)
             api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
-            api.upload_folder(
-                repo_id=hf_repo,
-                folder_path=str(ckpt_dir),
-                path_in_repo=f"checkpoints/{run_name}",
-            )
+            if ckpt_dir.exists():
+                api.upload_folder(
+                    repo_id=hf_repo,
+                    folder_path=str(ckpt_dir),
+                    path_in_repo=f"checkpoints/{run_name}",
+                )
+            else:
+                print(f"[modal_train] WARNING: no checkpoint dir at {ckpt_dir}, "
+                      "skipping checkpoint upload (logs still uploaded)")
             for p, dest in [
                 (csv_path, f"logs/{run_name}_metrics.csv"),
                 (log_path, f"logs/{run_name}_train.log"),
@@ -296,6 +306,7 @@ def main(
     hf_repo: str = "",
     save_every: int = 1000,
     window_pattern: str = "L",
+    data_shards: int = 32,
     extra_args: str = "",
 ):
     train_nanochat.remote(
@@ -303,5 +314,6 @@ def main(
         hf_repo=hf_repo,
         save_every=save_every,
         window_pattern=window_pattern,
+        data_shards=data_shards,
         extra_args=extra_args,
     )
