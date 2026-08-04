@@ -128,7 +128,7 @@ def train_nanochat(
     if NPROC > 1:
         launcher = f"{torchrun} --standalone --nproc_per_node={NPROC} -m scripts.base_train --"
     else:
-        launcher = f"{python} -m scripts.base_train --"
+        launcher = f"{python} -m scripts.base_train"   # no trailing '--'
 
 
     sanity = (
