@@ -5,17 +5,26 @@ on:
   workflow_dispatch:
     inputs:
       depth:
-        description: "0 = full speedrun (~2h, ~$70); >0 = quick base_train at that depth (e.g. 12)"
+        description: "Transformer depth (nanochat's single complexity dial)"
         required: false
-        default: "0"
-  # Optionally trigger on push to main, a schedule, etc:
-  # push:
-  #   branches: [main]
+        default: "12"
+      hf_repo:
+        description: "HuggingFace repo for checkpoints, e.g. yourname/nanochat"
+        required: false
+        default: "yourname/nanochat"   # <-- change to your HF username/repo
+      save_every:
+        description: "Checkpoint every N steps"
+        required: false
+        default: "1000"
+      extra_args:
+        description: "Extra base_train flags, e.g. --device-batch-size=16"
+        required: false
+        default: ""
 
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15   # runner only launches the job, doesn't wait for training
+    timeout-minutes: 15   # runner only launches; training continues on Modal
     steps:
       - uses: actions/checkout@v4
 
@@ -30,5 +39,10 @@ jobs:
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          modal run --detach modal_train.py --depth "${{ inputs.depth || '0' }}"
+          modal run --detach modal_train.py \
+            --depth "${{ inputs.depth }}" \
+            --hf-repo "${{ inputs.hf_repo }}" \
+            --save-every "${{ inputs.save_every }}" \
+            --extra-args "${{ inputs.extra_args }}"
