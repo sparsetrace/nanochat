@@ -1,5 +1,5 @@
-# .github/workflows/train.yml — STANDARD attention baseline
-name: Train nanochat (standard attention)
+# .github/workflows/DMAP.yml — HMAP with alpha=1 (kinetic + Doob potential) = DMAP face
+name: Train nanochat (DMAP)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
         required: false
         default: "1000"
       extra_args:
-        description: "Extra base_train flags"
+        description: "Extra base_train flags (variant flags already included)"
         required: false
         default: ""
 
@@ -46,8 +46,8 @@ jobs:
           RUN_TAG: ${{ inputs.run_tag }}
           SAVE_EVERY: ${{ inputs.save_every }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
-          HF_SUBFOLDER: attention
-          VARIANT_ARGS: ""
+          HF_SUBFOLDER: DMAP
+          VARIANT_ARGS: "--attn-variant hmap --hmap-alpha 1.0 --device-batch-size=8"
         run: |
           python -c "
           import os, modal
