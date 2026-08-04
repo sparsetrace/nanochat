@@ -33,7 +33,7 @@ import modal
 
 app = modal.App("nanochat")
 
-GPU_CONFIG = "B200"       # 192 GB HBM3e, ~$6.25/hr. For multi-GPU use e.g. "B200:4"
+GPU_CONFIG = "H100"       # 192 GB HBM3e, ~$6.25/hr. For multi-GPU use e.g. "B200:4"
 NPROC = 1                 # keep in sync with GPU_CONFIG; >1 switches to torchrun
 
 CACHE_DIR = "/root/.cache/nanochat"   # nanochat writes everything here by default
