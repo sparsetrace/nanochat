@@ -159,6 +159,14 @@ def train_nanochat(
         f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\""
     )
 
+    # One-time prerequisites (persisted on the Volume after first run)
+    tokenizer_dir = Path(CACHE_DIR) / "tokenizer"
+    if not tokenizer_dir.exists():
+        print("[modal_train] no tokenizer found — running one-time data+tokenizer setup")
+        _run_streamed(f"{python} -m nanochat.dataset -n 8")
+        _run_streamed(f"{python} -m scripts.tok_train")
+        ckpt_vol.commit()
+
     # NOTE: the trailing '--' separator is torchrun syntax only; plain python
     # argparse chokes on it (exit 2).
     if NPROC > 1:
