@@ -20,6 +20,10 @@ How it works
   Checkpoints + log + CSV are pushed to HuggingFace at the end.
 - HF auth uses the HF_TOKEN that GitHub Actions injects at launch
   (Secret.from_dict reads the runner's env at deploy time).
+- Default window_pattern is "L" (full causal context, no sliding windows):
+  we are running architecture experiments and want the most expressive,
+  mask-minimal configuration; SSSL is a wall-clock optimization we don't
+  need. Pass window_pattern="SSSL" to restore upstream behavior.
 
 Usage
 -----
@@ -178,16 +182,19 @@ def train_nanochat(
     depth: int = 12,
     hf_repo: str = "",
     save_every: int = 1000,
+    window_pattern: str = "L",
     extra_args: str = "",
 ) -> dict:
     """
     Pretrain nanochat at a given depth, checkpoint to the Volume, push
     checkpoints + training log + metrics CSV to HF.
 
-    depth      : transformer depth (the one nanochat complexity dial)
-    hf_repo    : HF repo id e.g. "yourname/nanochat"; empty string skips upload
-    save_every : checkpoint interval in steps (persisted to the Volume)
-    extra_args : extra CLI flags, e.g. "--device-batch-size=16"
+    depth          : transformer depth (the one nanochat complexity dial)
+    hf_repo        : HF repo id e.g. "yourname/nanochat"; empty skips upload
+    save_every     : checkpoint interval in steps (persisted to the Volume)
+    window_pattern : attention window pattern; "L" = full causal context
+                     (our experiment default), "SSSL" = upstream sliding-window
+    extra_args     : extra CLI flags, e.g. "--device-batch-size=8"
     """
     os.chdir(REPO_DIR)
     run_name = f"d{depth}"
@@ -238,6 +245,7 @@ def train_nanochat(
         f"--depth={depth} "
         f"--model-tag={run_name} "
         f"--save-every={save_every} "
+        f"--window-pattern={window_pattern} "
         f"{extra_args}"
     )
     t0 = time.time()
@@ -287,8 +295,13 @@ def main(
     depth: int = 12,
     hf_repo: str = "",
     save_every: int = 1000,
+    window_pattern: str = "L",
     extra_args: str = "",
 ):
     train_nanochat.remote(
-        depth=depth, hf_repo=hf_repo, save_every=save_every, extra_args=extra_args
+        depth=depth,
+        hf_repo=hf_repo,
+        save_every=save_every,
+        window_pattern=window_pattern,
+        extra_args=extra_args,
     )
