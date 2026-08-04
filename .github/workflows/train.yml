@@ -20,6 +20,10 @@ on:
         description: "Attention window pattern: L = full causal context (default), SSSL = upstream sliding-window"
         required: false
         default: "L"
+      run_tag:
+        description: "Distinct run name (checkpoints/logs/HF paths), e.g. d12-base, d12-hmap-a05. Empty = d{depth}"
+        required: false
+        default: ""
       extra_args:
         description: "Extra base_train flags, e.g. --device-batch-size=8"
         required: false
@@ -57,6 +61,7 @@ jobs:
           HF_REPO: ${{ inputs.hf_repo || vars.HF_REPO }}
           SAVE_EVERY: ${{ inputs.save_every }}
           WINDOW_PATTERN: ${{ inputs.window_pattern }}
+          RUN_TAG: ${{ inputs.run_tag }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
           python -c "
@@ -67,6 +72,7 @@ jobs:
               hf_repo=os.environ['HF_REPO'],
               save_every=int(os.environ['SAVE_EVERY']),
               window_pattern=os.environ['WINDOW_PATTERN'],
+              run_tag=os.environ['RUN_TAG'],
               extra_args=os.environ['EXTRA_ARGS'],
           )
           print('launched, call id:', call.object_id)
