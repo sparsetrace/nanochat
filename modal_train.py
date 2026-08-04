@@ -136,13 +136,12 @@ def train_nanochat(
         f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\" "
     )
     cmd = (
-        f"{sanity} && "
-        f"{launcher} "
-        f"--depth={depth} "
-        f"--model-tag={run_name} "
-        f"--run={run_name} "
-        f"--save-every={save_every} "
-        f"{extra_args}"
+      f"{sanity} && "
+      f"{launcher} "
+      f"--depth={depth} "
+      f"--model-tag={run_name} "
+      f"--save-every={save_every} "
+      f"{extra_args}"
     )
     print(f"[modal_train] running: {cmd}")
     t0 = time.time()
