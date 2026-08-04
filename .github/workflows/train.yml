@@ -1,0 +1,34 @@
+# .github/workflows/train.yml
+name: Train nanochat on Modal
+
+on:
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: "0 = full speedrun (~2h, ~$70); >0 = quick base_train at that depth (e.g. 12)"
+        required: false
+        default: "0"
+  # Optionally trigger on push to main, a schedule, etc:
+  # push:
+  #   branches: [main]
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # runner only launches the job, doesn't wait for training
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Launch training (detached)
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal run --detach modal_train.py --depth "${{ inputs.depth || '0' }}"
