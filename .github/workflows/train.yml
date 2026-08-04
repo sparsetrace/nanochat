@@ -24,7 +24,10 @@ on:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15   # runner only launches; training continues on Modal
+    # Deploy (incl. image build with uv sync) can take a while on commits that
+    # change the repo; the spawn itself is instant. Once spawned, training is
+    # fully detached — nothing on the GitHub side can cancel it.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -35,14 +38,30 @@ jobs:
       - name: Install Modal
         run: pip install modal
 
-      - name: Launch training (detached)
+      - name: Deploy app
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy modal_train.py
+
+      - name: Spawn training (fire-and-forget)
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          DEPTH: ${{ inputs.depth }}
+          HF_REPO: ${{ inputs.hf_repo || vars.HF_REPO }}
+          SAVE_EVERY: ${{ inputs.save_every }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
-          modal run --detach modal_train.py \
-            --depth "${{ inputs.depth }}" \
-            --hf-repo "${{ inputs.hf_repo || vars.HF_REPO }}" \
-            --save-every "${{ inputs.save_every }}" \
-            --extra-args "${{ inputs.extra_args }}"
+          python -c "
+          import os, modal
+          f = modal.Function.from_name('nanochat', 'train_nanochat')
+          call = f.spawn(
+              depth=int(os.environ['DEPTH']),
+              hf_repo=os.environ['HF_REPO'],
+              save_every=int(os.environ['SAVE_EVERY']),
+              extra_args=os.environ['EXTRA_ARGS'],
+          )
+          print('launched, call id:', call.object_id)
+          "
