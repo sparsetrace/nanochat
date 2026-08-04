@@ -5,27 +5,31 @@ Lives in the repo root of your nanochat fork.
 
 How it works
 ------------
-- GitHub Actions checks out your fork, then runs `modal run --detach ...`.
+- GitHub Actions checks out your fork, runs `modal deploy`, then spawns the
+  training function and exits. The run is fully detached from the runner —
+  no timeout or cancellation on the GitHub side can touch it.
 - The full repo is baked into the image and dependencies are installed the
   same way upstream does it: `uv sync --extra gpu` run inside the repo, with
   a Rust toolchain present (nanochat's tokenizer is a Rust extension built
-  via maturin — installing deps outside the repo produces a broken env).
-- Every commit triggers an image rebuild (~few minutes for uv sync). Correct
-  beats fast; optimize later.
-- All nanochat output (~/.cache/nanochat: data shards, tokenizer, checkpoints)
-  lives on a persistent Volume. A background thread commits it every 15 min
-  so a crash or timeout loses at most 15 min of checkpoints.
-- Training output is streamed line-by-line into Modal logs (stderr merged),
-  so the real traceback is always visible if the run dies.
-- Final checkpoints are pushed to HuggingFace using the HF_TOKEN that GitHub
-  Actions injects at launch (Secret.from_dict reads the runner's env).
+  via maturin). Every commit rebuilds the image (~few minutes of uv sync).
+- All nanochat output (~/.cache/nanochat: data shards, tokenizer, checkpoints,
+  training logs) lives on a persistent Volume. A background thread commits it
+  every 15 min so a crash loses at most 15 min of progress.
+- Training output is streamed line-by-line into Modal logs AND teed to a log
+  file; after training the step lines are parsed into a CSV (stdlib only).
+  Checkpoints + log + CSV are pushed to HuggingFace at the end.
+- HF auth uses the HF_TOKEN that GitHub Actions injects at launch
+  (Secret.from_dict reads the runner's env at deploy time).
 
 Usage
 -----
-#   HF_TOKEN=hf_... modal run --detach modal_train.py --depth 12 --hf-repo yourname/nanochat
+# CI does: modal deploy modal_train.py && spawn train_nanochat (see train.yml)
+# Locally, attached:  HF_TOKEN=hf_... modal run modal_train.py --depth 12 --hf-repo yourname/nanochat
 """
 
+import csv
 import os
+import re
 import subprocess
 import threading
 import time
@@ -43,12 +47,12 @@ REPO_DIR = "/root/nanochat"
 VENV = f"{REPO_DIR}/.venv"
 
 # ---------------------------------------------------------------------------
-# Persistent storage: dataset shards + tokenizer + checkpoints
+# Persistent storage: dataset shards + tokenizer + checkpoints + logs
 # ---------------------------------------------------------------------------
 ckpt_vol = modal.Volume.from_name("nanochat-cache", create_if_missing=True, version=2)
 
 # ---------------------------------------------------------------------------
-# HF token: read from the environment of whoever launches the run
+# HF token: read from the environment of whoever launches the deploy
 # (GitHub Actions passes secrets.HF_TOKEN as env — no Modal secret needed).
 # ---------------------------------------------------------------------------
 hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
@@ -82,9 +86,47 @@ image = (
     .run_commands(f"cd {REPO_DIR} && uv sync --extra gpu")
 )
 
+# ---------------------------------------------------------------------------
+# Training-log parsing (stdlib only). Matches nanochat's step lines, e.g.:
+# step 00180/02520 (7.14%) | loss: 3.790014 | lrm: 1.00 | dt: 991.36ms |
+#   tok/sec: 528,855 | bf16_mfu: 40.62 | ...
+# Non-matching lines (evals, warnings) are skipped; the raw log keeps them.
+# ---------------------------------------------------------------------------
+STEP_RE = re.compile(
+    r"step (\d+)/(\d+) \(([\d.]+)%\) \| loss: ([\d.]+) \| lrm: ([\d.]+) \| "
+    r"dt: ([\d.]+)ms \| tok/sec: ([\d,]+) \| bf16_mfu: ([\d.]+)"
+)
+CSV_FIELDS = ["step", "total_steps", "loss", "lrm", "dt_ms", "tok_per_sec", "bf16_mfu"]
+
+
+def parse_log_to_csv(log_path: Path, csv_path: Path) -> int:
+    """Extract per-step metrics from the raw training log into a CSV."""
+    if not log_path.exists():
+        return 0
+    rows = []
+    for line in log_path.read_text().splitlines():
+        m = STEP_RE.search(line)
+        if m:
+            rows.append(
+                {
+                    "step": int(m.group(1)),
+                    "total_steps": int(m.group(2)),
+                    "loss": float(m.group(4)),
+                    "lrm": float(m.group(5)),
+                    "dt_ms": float(m.group(6)),
+                    "tok_per_sec": int(m.group(7).replace(",", "")),
+                    "bf16_mfu": float(m.group(8)),
+                }
+            )
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
 
 def _periodic_volume_commit(stop: threading.Event, every_s: int = 900):
-    """Flush Volume writes every 15 min so checkpoints survive a crash."""
+    """Flush Volume writes every 15 min so checkpoints/logs survive a crash."""
     while not stop.wait(every_s):
         try:
             ckpt_vol.commit()
@@ -93,27 +135,31 @@ def _periodic_volume_commit(stop: threading.Event, every_s: int = 900):
             print(f"[modal_train] volume commit failed (non-fatal): {e}")
 
 
-def _run_streamed(cmd: str):
-    """Run cmd, streaming merged stdout+stderr line-by-line into Modal logs.
-
-    Guarantees the child's traceback is visible if it dies (unlike bare
-    subprocess.run, whose stderr can get lost in log routing).
-    """
+def _run_streamed(cmd: str, log_path: Path | None = None):
+    """Run cmd, streaming merged stdout+stderr into Modal logs, optionally
+    teeing every line to log_path. Guarantees child tracebacks are visible."""
     print(f"[modal_train] running: {cmd}", flush=True)
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        executable="/bin/bash",
-        cwd=REPO_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-    proc.wait()
+    log_f = open(log_path, "a") if log_path else None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            executable="/bin/bash",
+            cwd=REPO_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if log_f:
+                log_f.write(line)
+        proc.wait()
+    finally:
+        if log_f:
+            log_f.close()
     if proc.returncode != 0:
         raise RuntimeError(f"command failed with exit code {proc.returncode}: {cmd}")
 
@@ -135,7 +181,8 @@ def train_nanochat(
     extra_args: str = "",
 ) -> dict:
     """
-    Pretrain nanochat at a given depth, checkpoint to the Volume, push to HF.
+    Pretrain nanochat at a given depth, checkpoint to the Volume, push
+    checkpoints + training log + metrics CSV to HF.
 
     depth      : transformer depth (the one nanochat complexity dial)
     hf_repo    : HF repo id e.g. "yourname/nanochat"; empty string skips upload
@@ -145,7 +192,14 @@ def train_nanochat(
     os.chdir(REPO_DIR)
     run_name = f"d{depth}"
 
-    # Background committer so mid-run checkpoints are durable
+    # Log locations (on the Volume, so they persist and survive crashes)
+    logs_dir = Path(CACHE_DIR) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{run_name}_train.log"
+    csv_path = logs_dir / f"{run_name}_metrics.csv"
+    log_path.unlink(missing_ok=True)  # fresh log per run
+
+    # Background committer so mid-run checkpoints/logs are durable
     stop = threading.Event()
     threading.Thread(target=_periodic_volume_commit, args=(stop,), daemon=True).start()
 
@@ -159,7 +213,9 @@ def train_nanochat(
         f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\""
     )
 
-    # One-time prerequisites (persisted on the Volume after first run)
+    # One-time prerequisites (persisted on the Volume after first run).
+    # NOTE: mirror the exact commands from your fork's runs/speedrun.sh if
+    # these ever drift from upstream.
     tokenizer_dir = Path(CACHE_DIR) / "tokenizer"
     if not tokenizer_dir.exists():
         print("[modal_train] no tokenizer found — running one-time data+tokenizer setup")
@@ -186,13 +242,15 @@ def train_nanochat(
     )
     t0 = time.time()
     try:
-        _run_streamed(cmd)
+        _run_streamed(cmd, log_path=log_path)
     finally:
         stop.set()
+        n = parse_log_to_csv(log_path, csv_path)
+        print(f"[modal_train] parsed {n} step lines -> {csv_path}")
         ckpt_vol.commit()  # always flush whatever we have, even on failure
     print(f"[modal_train] training finished in {(time.time() - t0) / 3600:.2f} h")
 
-    # ── Push checkpoints to HuggingFace ──────────────────────────────────────
+    # ── Push checkpoints + logs to HuggingFace ───────────────────────────────
     if hf_repo:
         from huggingface_hub import HfApi
 
@@ -211,7 +269,15 @@ def train_nanochat(
                 folder_path=str(ckpt_dir),
                 path_in_repo=f"checkpoints/{run_name}",
             )
-            print(f"[modal_train] pushed {ckpt_dir} -> {hf_repo}/checkpoints/{run_name}")
+            for p, dest in [
+                (csv_path, f"logs/{run_name}_metrics.csv"),
+                (log_path, f"logs/{run_name}_train.log"),
+            ]:
+                if p.exists():
+                    api.upload_file(
+                        path_or_fileobj=str(p), path_in_repo=dest, repo_id=hf_repo
+                    )
+            print(f"[modal_train] pushed checkpoints + logs to {hf_repo}")
 
     return {"ok": True, "run": run_name, "hf_repo": hf_repo}
 
