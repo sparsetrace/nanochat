@@ -113,12 +113,6 @@ def train_nanochat(
     """
 
     # sanity check: confirm we're importing the fork's code, not a stale copy
-    import sys
-    sys.path.insert(0, REPO_DIR)
-    import nanochat.gpt
-    print("[sanity] using gpt.py from:", nanochat.gpt.__file__)
-
-  
     os.chdir(REPO_DIR)
     run_name = f"d{depth}"
 
@@ -136,7 +130,13 @@ def train_nanochat(
     else:
         launcher = f"{python} -m scripts.base_train --"
 
+
+    sanity = (
+        f'{python} -c "import nanochat.gpt; '
+        f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\" "
+    )
     cmd = (
+        f"{sanity} && "
         f"{launcher} "
         f"--depth={depth} "
         f"--model-tag={run_name} "
