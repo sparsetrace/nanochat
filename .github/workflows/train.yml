@@ -16,8 +16,12 @@ on:
         description: "Checkpoint every N steps"
         required: false
         default: "1000"
+      window_pattern:
+        description: "Attention window pattern: L = full causal context (default), SSSL = upstream sliding-window"
+        required: false
+        default: "L"
       extra_args:
-        description: "Extra base_train flags, e.g. --device-batch-size=16"
+        description: "Extra base_train flags, e.g. --device-batch-size=8"
         required: false
         default: ""
 
@@ -52,6 +56,7 @@ jobs:
           DEPTH: ${{ inputs.depth }}
           HF_REPO: ${{ inputs.hf_repo || vars.HF_REPO }}
           SAVE_EVERY: ${{ inputs.save_every }}
+          WINDOW_PATTERN: ${{ inputs.window_pattern }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
           python -c "
@@ -61,6 +66,7 @@ jobs:
               depth=int(os.environ['DEPTH']),
               hf_repo=os.environ['HF_REPO'],
               save_every=int(os.environ['SAVE_EVERY']),
+              window_pattern=os.environ['WINDOW_PATTERN'],
               extra_args=os.environ['EXTRA_ARGS'],
           )
           print('launched, call id:', call.object_id)
