@@ -111,6 +111,14 @@ def train_nanochat(
     save_every : checkpoint interval in steps (persisted to the Volume)
     extra_args : extra CLI flags, e.g. "--device-batch-size=16"
     """
+
+    # sanity check: confirm we're importing the fork's code, not a stale copy
+    import sys
+    sys.path.insert(0, REPO_DIR)
+    import nanochat.gpt
+    print("[sanity] using gpt.py from:", nanochat.gpt.__file__)
+
+  
     os.chdir(REPO_DIR)
     run_name = f"d{depth}"
 
