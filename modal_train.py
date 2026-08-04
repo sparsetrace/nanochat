@@ -92,7 +92,7 @@ def _periodic_volume_commit(stop: threading.Event, every_s: int = 900):
     cpu=8,
     memory=32768,           # 32 GiB; dataloader workers are the main consumer
     ephemeral_disk=80_000,  # 80 GiB scratch (Volume holds the durable data)
-    timeout=36 * 60 * 60,   # 36 h ceiling
+    timeout=1 * 60 * 60,   # 36 h ceiling
     retries=0,              # a retry restarts training from scratch = $$$. Investigate failures manually.
     volumes={CACHE_DIR: ckpt_vol},
     secrets=[hf_secret],
