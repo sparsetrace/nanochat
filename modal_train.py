@@ -184,6 +184,7 @@ def train_nanochat(
     save_every: int = 1000,
     window_pattern: str = "L",
     data_shards: int = 32,
+    run_tag: str = "",
     extra_args: str = "",
 ) -> dict:
     """
@@ -198,10 +199,13 @@ def train_nanochat(
     data_shards    : pretraining shards to ensure downloaded (d12 with 8 shards
                      repeated data 4x -> use ~32+ so epoch stays ~1; bigger
                      depths need more, see runs/speedrun.sh)
+    run_tag        : distinct name for this run (model-tag, log filenames, HF
+                     paths). Defaults to "d{depth}". Use e.g. "d12-base",
+                     "d12-hmap-a05" so experiment arms don't overwrite each other.
     extra_args     : extra CLI flags, e.g. "--device-batch-size=8"
     """
     os.chdir(REPO_DIR)
-    run_name = f"d{depth}"
+    run_name = run_tag if run_tag else f"d{depth}"
 
     # Log locations (on the Volume, so they persist and survive crashes)
     logs_dir = Path(CACHE_DIR) / "logs"
@@ -267,7 +271,11 @@ def train_nanochat(
     print(f"[modal_train] training finished in {(time.time() - t0) / 3600:.2f} h")
 
     # ── Push checkpoints + logs to HuggingFace ───────────────────────────────
-    if hf_repo:
+    if not hf_repo:
+        print("[modal_train] hf_repo is EMPTY — skipping HF upload entirely. "
+              "(Set the HF_REPO repository *variable* in GitHub, or fill the "
+              "hf_repo field in the workflow launch form.)")
+    else:
         from huggingface_hub import HfApi
 
         token = os.environ.get("HF_TOKEN", "")
@@ -307,6 +315,7 @@ def main(
     save_every: int = 1000,
     window_pattern: str = "L",
     data_shards: int = 32,
+    run_tag: str = "",
     extra_args: str = "",
 ):
     train_nanochat.remote(
@@ -315,5 +324,6 @@ def main(
         save_every=save_every,
         window_pattern=window_pattern,
         data_shards=data_shards,
+        run_tag=run_tag,
         extra_args=extra_args,
     )
