@@ -101,6 +101,38 @@ STEP_RE = re.compile(
 )
 CSV_FIELDS = ["step", "total_steps", "loss", "lrm", "dt_ms", "tok_per_sec", "bf16_mfu"]
 
+# ICL/induction eval lines printed by base_train (see nanochat/icl_eval.py)
+ICL_RE = re.compile(
+    r"Step (\d+) \| ICL early: ([\d.]+) late: ([\d.]+) score: ([+\-][\d.]+) \| "
+    r"Induction loss: ([\d.]+) acc: ([\d.]+) \(random-half: ([\d.]+)\)"
+)
+ICL_FIELDS = ["step", "icl_early", "icl_late", "icl_score",
+              "induction_loss", "induction_acc", "random_half_loss"]
+
+
+def parse_icl_to_csv(log_path: Path, csv_path: Path) -> int:
+    """Extract ICL/induction eval lines from the raw training log into a CSV."""
+    if not log_path.exists():
+        return 0
+    rows = []
+    for line in log_path.read_text().splitlines():
+        m = ICL_RE.search(line)
+        if m:
+            rows.append({
+                "step": int(m.group(1)),
+                "icl_early": float(m.group(2)),
+                "icl_late": float(m.group(3)),
+                "icl_score": float(m.group(4)),
+                "induction_loss": float(m.group(5)),
+                "induction_acc": float(m.group(6)),
+                "random_half_loss": float(m.group(7)),
+            })
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=ICL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
 
 def parse_log_to_csv(log_path: Path, csv_path: Path) -> int:
     """Extract per-step metrics from the raw training log into a CSV."""
@@ -279,6 +311,7 @@ def train_nanochat(
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"{run_name}_train.log"
     csv_path = logs_dir / f"{run_name}_metrics.csv"
+    icl_csv_path = logs_dir / f"{run_name}_icl.csv"
     samples_path = logs_dir / f"{run_name}_samples.txt"
     log_path.unlink(missing_ok=True)  # fresh log per run
 
@@ -414,8 +447,10 @@ def train_nanochat(
                 print("[modal_train] WARNING: mirror thread still busy after 10 min; "
                       "proceeding anyway (daemon thread, container may linger briefly)")
         trained_steps = parse_log_to_csv(log_path, csv_path)
+        n_icl = parse_icl_to_csv(log_path, icl_csv_path)
         ns = extract_samples(log_path, samples_path, run_name)
         print(f"[modal_train] parsed {trained_steps} step lines -> {csv_path}; "
+              f"{n_icl} ICL eval lines -> {icl_csv_path}; "
               f"extracted {ns} samples -> {samples_path}")
         ckpt_vol.commit()
     print(f"[modal_train] training finished in {(time.time() - t0) / 3600:.2f} h")
@@ -446,6 +481,7 @@ def train_nanochat(
                   "skipping checkpoint upload")
         for p, dest in [
             (csv_path, f"{hf_subfolder}/logs/{run_name}_metrics.csv"),
+            (icl_csv_path, f"{hf_subfolder}/logs/{run_name}_icl.csv"),
             (log_path, f"{hf_subfolder}/logs/{run_name}_train.log"),
             (samples_path, f"{hf_subfolder}/samples/{run_name}_samples.txt"),
         ]:
