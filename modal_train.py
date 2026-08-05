@@ -84,7 +84,10 @@ image = (
         ".",
         remote_path=REPO_DIR,
         copy=True,
-        ignore=[".git", ".venv", "__pycache__", "*.pyc", ".github"],
+        ignore=[".git", ".venv", "__pycache__", "*.pyc", ".github",
+                "modal_train.py"],  # harness runs from the deploy-time checkout,
+                                    # not inside the image — excluding it means
+                                    # harness edits don't rebuild the image
     )
     .run_commands(f"cd {REPO_DIR} && uv sync --extra gpu")
 )
@@ -218,6 +221,8 @@ def _run_streamed(cmd: str, log_path: Path | None = None):
     memory=32768,
     timeout=24 * 60 * 60,   # Modal's max
     retries=0,
+    scaledown_window=5,     # tear the container down ~immediately after return
+                            # (no lingering "idle" state after the run finishes)
     volumes={CACHE_DIR: ckpt_vol},
     secrets=[hf_secret],
 )
@@ -230,6 +235,7 @@ def train_nanochat(
     data_shards: int = 32,
     run_tag: str = "",
     resume: str = "auto",
+    add_steps: int = -1,
     extra_args: str = "",
 ) -> dict:
     """
@@ -251,6 +257,16 @@ def train_nanochat(
                      same run_tag continues it automatically.
                      "never" — always fresh. "force" — resume without the
                      identity check (use with care).
+    add_steps      : ADDITIVE training budget for this launch. Fresh run:
+                     train add_steps steps total. Resumed run: train add_steps
+                     MORE steps (num_iterations = checkpoint step + add_steps),
+                     so every launch does work and "finished" no-ops disappear.
+                     -1 = nanochat's compute-optimal horizon (classic behavior).
+                     NOTE: extending past the original horizon re-enters the LR
+                     warmdown with a new endpoint — LR jumps back up before
+                     annealing again (WSD-like). Fine for exploration and for
+                     chunking long runs under the 24h cap; for clean A/B arms
+                     prefer one uninterrupted run at the default horizon.
     extra_args     : extra base_train flags, e.g.
                      "--attn-variant hmap --hmap-alpha 0.0 --device-batch-size=8"
     """
@@ -284,6 +300,7 @@ def train_nanochat(
     #         run_tags start fresh and same-run_tag relaunches continue.
     # "never": always fresh. "force": resume, skipping the identity check.
     resume_flag = ""
+    resumed_step = 0  # step of the checkpoint we resumed from (0 = fresh)
     if api is not None and resume != "never":
         try:
             import json as _json
@@ -320,6 +337,7 @@ def train_nanochat(
                         dest = ckpt_dir / Path(repo_file).name
                         dest.write_bytes(Path(local).read_bytes())
                     resume_flag = f"--resume-from-step={resume_step} "
+                    resumed_step = resume_step
                     why = "identity match" if same_run else "FORCED (identity check skipped)"
                     print(f"[modal_train] AUTO-RESUME [{why}]: continuing run "
                           f"'{ckpt_tag}' from step {resume_step} "
@@ -365,6 +383,14 @@ def train_nanochat(
     else:
         launcher = f"{python} -m scripts.base_train"
 
+    # Additive horizon: this launch trains add_steps (more) steps.
+    horizon_flag = ""
+    if add_steps > 0:
+        horizon = resumed_step + add_steps
+        horizon_flag = f"--num-iterations={horizon} "
+        print(f"[modal_train] additive budget: {add_steps} steps this launch "
+              f"(from step {resumed_step} -> horizon {horizon})")
+
     cmd = (
         f"{launcher} "
         f"--depth={depth} "
@@ -372,6 +398,7 @@ def train_nanochat(
         f"--save-every={save_every} "
         f"--window-pattern={window_pattern} "
         f"{resume_flag}"
+        f"{horizon_flag}"
         f"{extra_args}"
     )
     t0 = time.time()
@@ -449,6 +476,7 @@ def main(
     data_shards: int = 32,
     run_tag: str = "",
     resume: str = "auto",
+    add_steps: int = -1,
     extra_args: str = "",
 ):
     train_nanochat.remote(
@@ -460,5 +488,6 @@ def main(
         data_shards=data_shards,
         run_tag=run_tag,
         resume=resume,
+        add_steps=add_steps,
         extra_args=extra_args,
     )
