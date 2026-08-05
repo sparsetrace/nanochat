@@ -13,10 +13,14 @@ on:
         required: false
         default: ""
       resume:
-        description: "Resume from <variant>/latest/ on HF (run_tag/depth/flags must match the original run)"
-        type: boolean
+        description: "Resume policy: auto = continue if <variant>/latest/ matches this run_tag+depth; never; force"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
         required: false
-        default: false
+        default: "auto"
       save_every:
         description: "Checkpoint every N steps"
         required: false
@@ -64,7 +68,7 @@ jobs:
               hf_subfolder=os.environ['HF_SUBFOLDER'],
               save_every=int(os.environ['SAVE_EVERY']),
               run_tag=os.environ['RUN_TAG'],
-              resume=os.environ['RESUME'] == 'true',
+              resume=os.environ['RESUME'],
               extra_args=extra,
           )
           print('launched, call id:', call.object_id)
