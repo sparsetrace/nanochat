@@ -213,7 +213,7 @@ def train_nanochat(
     window_pattern: str = "L",
     data_shards: int = 32,
     run_tag: str = "",
-    resume: bool = False,
+    resume: str = "auto",
     extra_args: str = "",
 ) -> dict:
     """
@@ -228,12 +228,13 @@ def train_nanochat(
     data_shards    : pretraining shards to ensure downloaded (32+ for d12)
     run_tag        : distinct run name; defaults to "d{depth}". Use e.g.
                      "d12-a05" for the alpha=0.5 arm.
-    resume         : if True, download <hf_subfolder>/latest/ from HF and pass
-                     --resume-from-step to continue an interrupted run. The
-                     run_tag, depth, and variant flags MUST match the original
-                     run (the checkpoint carries model shapes and dataloader
-                     state). Default False: fresh runs never silently continue
-                     a finished predecessor.
+    resume         : "auto" (default) — resume from <hf_subfolder>/latest/ IF
+                     the checkpoint's metadata identifies it as this same run
+                     (model_tag == run_tag and depth matches); otherwise fresh.
+                     New run_tags therefore always start fresh; relaunching the
+                     same run_tag continues it automatically.
+                     "never" — always fresh. "force" — resume without the
+                     identity check (use with care).
     extra_args     : extra base_train flags, e.g.
                      "--attn-variant hmap --hmap-alpha 0.0 --device-batch-size=8"
     """
@@ -262,53 +263,60 @@ def train_nanochat(
         api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
 
     # ── Resume: look for <subfolder>/latest/ on HF ───────────────────────────
-    # Opt-in (resume=True): download prior checkpoint files into ckpt_dir,
-    # parse the step from meta_*.json filenames, and pass --resume-from-step
-    # so base_train continues (model + optimizer + dataloader state).
-    # Opt-out (default): report what exists but always train from scratch.
+    # "auto": resume iff the checkpoint's own metadata says it is THIS run
+    #         (user_config.model_tag == run_name and depth matches) — so new
+    #         run_tags start fresh and same-run_tag relaunches continue.
+    # "never": always fresh. "force": resume, skipping the identity check.
     resume_flag = ""
-    if api is not None:
+    if api is not None and resume != "never":
         try:
+            import json as _json
+            from huggingface_hub import hf_hub_download
             existing = [
                 f for f in api.list_repo_files(repo_id=hf_repo)
                 if f.startswith(f"{hf_subfolder}/latest/")
             ]
-            if existing and resume:
-                from huggingface_hub import hf_hub_download
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-                for repo_file in existing:
-                    local = hf_hub_download(
-                        repo_id=hf_repo, filename=repo_file, token=token,
-                        local_dir=str(Path(CACHE_DIR) / "hf_resume"),
-                    )
-                    dest = ckpt_dir / Path(repo_file).name
-                    dest.write_bytes(Path(local).read_bytes())
-                # Parse resume step from meta_XXXXXX.json filenames (max = newest)
-                steps = []
-                for repo_file in existing:
-                    m = re.match(r"meta_(\d+)\.json$", Path(repo_file).name)
-                    if m:
-                        steps.append(int(m.group(1)))
-                if steps:
-                    resume_step = max(steps)
-                    resume_flag = f"--resume-from-step={resume_step} "
-                    print(f"[modal_train] RESUME: continuing from step {resume_step} "
-                          f"({len(existing)} file(s) from {hf_subfolder}/latest/ -> {ckpt_dir})")
-                else:
-                    print("[modal_train] RESUME requested but no meta_*.json found "
-                          "in latest/ — cannot determine step, training fresh.")
-            elif existing:
-                print(f"[modal_train] {len(existing)} checkpoint file(s) exist in "
-                      f"{hf_subfolder}/latest/ (resume=False — training fresh).")
+            meta_steps = []
+            for repo_file in existing:
+                m = re.match(r"meta_(\d+)\.json$", Path(repo_file).name)
+                if m:
+                    meta_steps.append((int(m.group(1)), repo_file))
+            if not meta_steps:
+                print(f"[modal_train] no resumable checkpoint in {hf_subfolder}/latest/ "
+                      "— fresh start.")
             else:
-                if resume:
-                    print(f"[modal_train] RESUME requested but {hf_subfolder}/latest/ "
-                          "is empty — training fresh.")
+                resume_step, meta_file = max(meta_steps)
+                meta_local = hf_hub_download(
+                    repo_id=hf_repo, filename=meta_file, token=token,
+                    local_dir=str(Path(CACHE_DIR) / "hf_resume"),
+                )
+                meta = _json.loads(Path(meta_local).read_text())
+                ckpt_tag = (meta.get("user_config", {}) or {}).get("model_tag") or f"d{meta.get('user_config', {}).get('depth', '?')}"
+                ckpt_depth = (meta.get("user_config", {}) or {}).get("depth")
+                same_run = (ckpt_tag == run_name) and (ckpt_depth == depth)
+                if same_run or resume == "force":
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    for repo_file in existing:
+                        local = hf_hub_download(
+                            repo_id=hf_repo, filename=repo_file, token=token,
+                            local_dir=str(Path(CACHE_DIR) / "hf_resume"),
+                        )
+                        dest = ckpt_dir / Path(repo_file).name
+                        dest.write_bytes(Path(local).read_bytes())
+                    resume_flag = f"--resume-from-step={resume_step} "
+                    why = "identity match" if same_run else "FORCED (identity check skipped)"
+                    print(f"[modal_train] AUTO-RESUME [{why}]: continuing run "
+                          f"'{ckpt_tag}' from step {resume_step} "
+                          f"({len(existing)} file(s) -> {ckpt_dir})")
                 else:
-                    print(f"[modal_train] no prior checkpoint in {hf_subfolder}/latest/ "
-                          "— fresh start.")
+                    print(f"[modal_train] checkpoint in {hf_subfolder}/latest/ belongs to "
+                          f"run '{ckpt_tag}' (d{ckpt_depth}), current run is "
+                          f"'{run_name}' (d{depth}) — fresh start. "
+                          "(Pass resume='force' to override.)")
         except Exception as e:
             print(f"[modal_train] resume check failed (non-fatal, fresh start): {e}")
+    elif resume == "never":
+        print("[modal_train] resume='never' — fresh start.")
 
     # ── Data + tokenizer prerequisites (Volume-persistent) ──────────────────
     python = f"{VENV}/bin/python"
@@ -406,7 +414,7 @@ def main(
     window_pattern: str = "L",
     data_shards: int = 32,
     run_tag: str = "",
-    resume: bool = False,
+    resume: str = "auto",
     extra_args: str = "",
 ):
     train_nanochat.remote(
