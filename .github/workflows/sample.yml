@@ -1,0 +1,76 @@
+# .github/workflows/sample.yml — sample text from any trained checkpoint on HF
+name: Sample from checkpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_subfolder:
+        description: "Variant subfolder in the HF repo"
+        type: choice
+        options:
+          - attention
+          - AMAP
+          - DMAP
+        required: false
+        default: "attention"
+      run_tag:
+        description: "Run tag whose checkpoint to sample (e.g. d12-base, d12-a00, d12-a10)"
+        required: false
+        default: "d12-base"
+      source:
+        description: "Checkpoint source: latest = <sub>/latest/, archive = <sub>/checkpoints/<run_tag>/"
+        type: choice
+        options:
+          - latest
+          - archive
+        required: false
+        default: "latest"
+      step:
+        description: "Checkpoint step (-1 = newest available)"
+        required: false
+        default: "-1"
+      prompts:
+        description: "Semicolon-separated prompts (empty = default 7)"
+        required: false
+        default: ""
+      num_samples:
+        description: "Samples per prompt"
+        required: false
+        default: "1"
+      max_tokens:
+        description: "Tokens to generate per sample"
+        required: false
+        default: "64"
+      temperature:
+        description: "Sampling temperature (0 = greedy)"
+        required: false
+        default: "0.8"
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      # Run ATTACHED: sampling takes minutes and the generated text streams
+      # straight into this Actions log (also uploaded to HF as a .txt).
+      - name: Sample
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run modal_sample.py \
+            --hf-subfolder "${{ inputs.hf_subfolder }}" \
+            --run-tag "${{ inputs.run_tag }}" \
+            --source "${{ inputs.source }}" \
+            --step "${{ inputs.step }}" \
+            --prompts "${{ inputs.prompts }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --max-tokens "${{ inputs.max_tokens }}" \
+            --temperature "${{ inputs.temperature }}"
