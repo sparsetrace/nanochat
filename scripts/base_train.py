@@ -9,6 +9,14 @@ torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+
+Additions in this fork:
+- --attn-variant / --hmap-alpha / --witten : HMAP attention family (see nanochat/gpt.py)
+- --objective mlm : BERT-style masked language modeling (bidirectional attention,
+  masked-token cross-entropy). AR-specific evals (val bpb, CORE, Engine sampling)
+  are auto-disabled in MLM mode; the training signal is the masked-token loss.
+- Engine-based sampling is auto-skipped for attn_variant != "standard"
+  (HMAP has no kv-cache inference path yet).
 """
 
 import os
@@ -52,6 +60,13 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Attention variant (HMAP family; see nanochat/gpt.py)
+parser.add_argument("--attn-variant", type=str, default="standard", choices=["standard", "hmap"], help="attention mechanism; 'hmap' with --hmap-alpha 0 is AMAP, 1 is the DMAP face")
+parser.add_argument("--hmap-alpha", type=float, default=0.0, help="HMAP homotopy coordinate in [0,1]: 0=AMAP (kinetic+flux), 1=DMAP (kinetic+Doob)")
+parser.add_argument("--witten", action="store_true", help="add independent Witten potential diag(R W_W R^T) to the exact sector (adds params)")
+# Objective
+parser.add_argument("--objective", type=str, default="ar", choices=["ar", "mlm"], help="ar = autoregressive next-token (default), mlm = BERT-style masked LM (bidirectional)")
+parser.add_argument("--mlm-mask-prob", type=float, default=0.15, help="fraction of positions selected for MLM prediction")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -79,6 +94,16 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# MLM mode implies bidirectional attention and disables AR-specific evals
+is_mlm = args.objective == "mlm"
+if is_mlm:
+    assert args.window_pattern.upper() == "L", "MLM requires --window-pattern L (bidirectional full context)"
+    if args.eval_every > 0 or args.core_metric_every > 0 or args.sample_every > 0:
+        print0("[mlm] disabling AR-specific evals: val bpb, CORE metric, Engine sampling")
+    args.eval_every = -1
+    args.core_metric_every = -1
+    args.sample_every = -1
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -123,6 +148,18 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
+# MLM: reserve an id for [MASK]. The tokenizer's vocab is typically already a
+# multiple of the pad size, so there is no spare padded row — we grow the model
+# vocab by 1 (further padded inside GPT). MASK is a legal *input* id and a
+# never-targeted logit class; the sliced logits include it but cross-entropy
+# targets never point at it.
+MASK_ID = None
+model_vocab_size = vocab_size
+if is_mlm:
+    MASK_ID = vocab_size
+    model_vocab_size = vocab_size + 1
+    print0(f"[mlm] MASK_ID = {MASK_ID} (model vocab grown to {model_vocab_size:,})")
+
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
@@ -134,9 +171,13 @@ def build_model_meta(depth):
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
+        sequence_len=args.max_seq_len, vocab_size=model_vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        attn_variant=args.attn_variant,
+        hmap_alpha=args.hmap_alpha,
+        witten=args.witten,
+        bidirectional=is_mlm,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -244,6 +285,30 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+
+# -----------------------------------------------------------------------------
+# MLM masking (BERT-style dynamic masking, applied per batch on the fly)
+
+def apply_mlm_masking(x):
+    """Given input tokens x (B, T), return (x_masked, y_mlm):
+    - select mlm_mask_prob of positions for prediction
+    - of selected: 80% -> MASK_ID, 10% -> random token, 10% -> kept
+    - y_mlm is the original token at selected positions, -1 elsewhere
+      (cross_entropy ignore_index=-1 restricts the loss to selected positions).
+    """
+    selected = torch.rand(x.shape, device=x.device) < args.mlm_mask_prob
+    # Guarantee at least one selected position per sequence (avoid all -1 targets)
+    none_selected = ~selected.any(dim=1)
+    if none_selected.any():
+        selected[none_selected, 0] = True
+    y_mlm = torch.where(selected, x, torch.full_like(x, -1))
+    r = torch.rand(x.shape, device=x.device)
+    x_masked = x.clone()
+    x_masked[selected & (r < 0.8)] = MASK_ID
+    rand_tokens = torch.randint(0, vocab_size, x.shape, device=x.device)
+    x_masked[selected & (r >= 0.8) & (r < 0.9)] = rand_tokens[selected & (r >= 0.8) & (r < 0.9)]
+    # remaining 10%: keep original token
+    return x_masked, y_mlm
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -454,24 +519,29 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
+    # NOTE: Engine uses the kv-cache inference path, which HMAP does not
+    # support — auto-skip sampling for non-standard attention variants.
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
-        model.train()
+        if args.attn_variant != "standard":
+            print0(f"[sample] skipped: Engine kv-cache sampling unsupported for attn_variant={args.attn_variant}")
+        else:
+            model.eval()
+            prompts = [
+                "The capital of France is",
+                "The chemical symbol of gold is",
+                "If yesterday was Friday, then tomorrow will be",
+                "The opposite of hot is",
+                "The planets of the solar system are:",
+                "My favorite color is",
+                "If 5*x + 3 = 13, then x is",
+            ]
+            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model):
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
+            model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
@@ -508,7 +578,11 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        if is_mlm:
+            x_in, y_in = apply_mlm_masking(x)
+        else:
+            x_in, y_in = x, y
+        loss = model(x_in, y_in)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
