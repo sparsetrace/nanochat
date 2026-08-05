@@ -213,6 +213,7 @@ def train_nanochat(
     window_pattern: str = "L",
     data_shards: int = 32,
     run_tag: str = "",
+    resume: bool = False,
     extra_args: str = "",
 ) -> dict:
     """
@@ -227,6 +228,12 @@ def train_nanochat(
     data_shards    : pretraining shards to ensure downloaded (32+ for d12)
     run_tag        : distinct run name; defaults to "d{depth}". Use e.g.
                      "d12-a05" for the alpha=0.5 arm.
+    resume         : if True, download <hf_subfolder>/latest/ from HF and pass
+                     --resume-from-step to continue an interrupted run. The
+                     run_tag, depth, and variant flags MUST match the original
+                     run (the checkpoint carries model shapes and dataloader
+                     state). Default False: fresh runs never silently continue
+                     a finished predecessor.
     extra_args     : extra base_train flags, e.g.
                      "--attn-variant hmap --hmap-alpha 0.0 --device-batch-size=8"
     """
@@ -254,18 +261,19 @@ def train_nanochat(
         api = HfApi(token=token)
         api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
 
-    # ── Resume detection: look for <subfolder>/latest/ on HF ────────────────
-    # Downloads any prior checkpoint into ckpt_dir and reports. NOTE (RESUME):
-    # stock nanochat base_train has no resume flag and trains from step 0
-    # regardless; once your fork has one, pass it via extra_args (e.g.
-    # "--resume") and this download makes it functional.
+    # ── Resume: look for <subfolder>/latest/ on HF ───────────────────────────
+    # Opt-in (resume=True): download prior checkpoint files into ckpt_dir,
+    # parse the step from meta_*.json filenames, and pass --resume-from-step
+    # so base_train continues (model + optimizer + dataloader state).
+    # Opt-out (default): report what exists but always train from scratch.
+    resume_flag = ""
     if api is not None:
         try:
             existing = [
                 f for f in api.list_repo_files(repo_id=hf_repo)
                 if f.startswith(f"{hf_subfolder}/latest/")
             ]
-            if existing:
+            if existing and resume:
                 from huggingface_hub import hf_hub_download
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 for repo_file in existing:
@@ -275,13 +283,30 @@ def train_nanochat(
                     )
                     dest = ckpt_dir / Path(repo_file).name
                     dest.write_bytes(Path(local).read_bytes())
-                print(f"[modal_train] RESUME: found {len(existing)} checkpoint file(s) "
-                      f"in {hf_subfolder}/latest/ — downloaded to {ckpt_dir}. "
-                      "Reminder: base_train needs a resume flag to actually continue "
-                      "from them (see RESUME note in this file).")
+                # Parse resume step from meta_XXXXXX.json filenames (max = newest)
+                steps = []
+                for repo_file in existing:
+                    m = re.match(r"meta_(\d+)\.json$", Path(repo_file).name)
+                    if m:
+                        steps.append(int(m.group(1)))
+                if steps:
+                    resume_step = max(steps)
+                    resume_flag = f"--resume-from-step={resume_step} "
+                    print(f"[modal_train] RESUME: continuing from step {resume_step} "
+                          f"({len(existing)} file(s) from {hf_subfolder}/latest/ -> {ckpt_dir})")
+                else:
+                    print("[modal_train] RESUME requested but no meta_*.json found "
+                          "in latest/ — cannot determine step, training fresh.")
+            elif existing:
+                print(f"[modal_train] {len(existing)} checkpoint file(s) exist in "
+                      f"{hf_subfolder}/latest/ (resume=False — training fresh).")
             else:
-                print(f"[modal_train] no prior checkpoint in {hf_subfolder}/latest/ "
-                      "— fresh start.")
+                if resume:
+                    print(f"[modal_train] RESUME requested but {hf_subfolder}/latest/ "
+                          "is empty — training fresh.")
+                else:
+                    print(f"[modal_train] no prior checkpoint in {hf_subfolder}/latest/ "
+                          "— fresh start.")
         except Exception as e:
             print(f"[modal_train] resume check failed (non-fatal, fresh start): {e}")
 
@@ -320,6 +345,7 @@ def train_nanochat(
         f"--model-tag={run_name} "
         f"--save-every={save_every} "
         f"--window-pattern={window_pattern} "
+        f"{resume_flag}"
         f"{extra_args}"
     )
     t0 = time.time()
@@ -380,6 +406,7 @@ def main(
     window_pattern: str = "L",
     data_shards: int = 32,
     run_tag: str = "",
+    resume: bool = False,
     extra_args: str = "",
 ):
     train_nanochat.remote(
@@ -390,5 +417,6 @@ def main(
         window_pattern=window_pattern,
         data_shards=data_shards,
         run_tag=run_tag,
+        resume=resume,
         extra_args=extra_args,
     )
