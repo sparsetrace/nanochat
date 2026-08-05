@@ -25,6 +25,10 @@ on:
         description: "Checkpoint every N steps"
         required: false
         default: "1000"
+      add_steps:
+        description: "Additive step budget: fresh run trains N steps; relaunch trains N MORE. -1 = full compute-optimal horizon"
+        required: false
+        default: "-1"
       extra_args:
         description: "Extra base_train flags"
         required: false
@@ -54,6 +58,7 @@ jobs:
           DEPTH: ${{ inputs.depth }}
           RUN_TAG: ${{ inputs.run_tag }}
           RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
           SAVE_EVERY: ${{ inputs.save_every }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
           HF_SUBFOLDER: attention
@@ -69,6 +74,7 @@ jobs:
               save_every=int(os.environ['SAVE_EVERY']),
               run_tag=os.environ['RUN_TAG'],
               resume=os.environ['RESUME'],
+              add_steps=int(os.environ['ADD_STEPS']),
               extra_args=extra,
           )
           print('launched, call id:', call.object_id)
