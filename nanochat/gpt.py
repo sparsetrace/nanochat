@@ -215,34 +215,51 @@ class CausalSelfAttention(nn.Module):
             kh = k.transpose(1, 2)
             vh = v.transpose(1, 2)
 
-            # Kinetic sector: PSD Gram of m = (q+k)/sqrt(2)
+            # Kinetic sector vectors and (optional) node potential
             m = (qh + kh) * (0.5 ** 0.5)
-            sym = 0.5 * (m @ m.transpose(-2, -1))                 # (B,H,T,T)
-
-            logits = sym
-            # Flux sector (circulation), weight (1-a)
-            if a < 1.0:
-                qk = qh @ kh.transpose(-2, -1)
-                asym = 0.5 * (qk - qk.transpose(-2, -1))
-                logits = logits + (1.0 - a) * asym
-            # Exact/Doob sector, weight a: coboundary 1/2 (g_i - g_j).
-            # (Post-softmax this equals the per-key tilt -a/2 g_j; we keep the
-            # antisymmetrized form for interpretability/logging.)
+            g = None
             if a > 0.0:
-                g = (qh * kh).sum(-1)                              # (B,H,T) node potential
+                g = (qh * kh).sum(-1)                              # (B,H,T)
                 if self.witten:
                     qw = self.c_qw(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
                     kw = self.c_kw(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
                     qw, kw = norm(qw), norm(kw)  # same scale control as q,k
                     g = g + (qw * kw).sum(-1)
-                coboundary = 0.5 * (g.unsqueeze(-1) - g.unsqueeze(-2))  # (B,H,T,T)
-                logits = logits + a * coboundary
 
-            logits = logits * (self.head_dim ** -0.5)
-            logits = logits + self._get_eager_mask(T, window_size, x.device)
-            attn = logits.softmax(dim=-1)
-            y = (attn @ vh).transpose(1, 2)                        # (B, T, H, D)
-            y = y.contiguous().view(B, T, -1)
+            scale = self.head_dim ** -0.5
+            mask = self._get_eager_mask(T, window_size, x.device)   # (T,T)
+
+            def _hmap_block(q_blk, k_blk, m_blk, g_blk, rows):
+                """Attention output for a block of query rows against all keys.
+                logits = 1/2<m,m> + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)."""
+                logits = 0.5 * (m_blk @ m.transpose(-2, -1))        # kinetic Gram rows
+                if a < 1.0:
+                    qk = q_blk @ kh.transpose(-2, -1)
+                    kq = k_blk @ qh.transpose(-2, -1)
+                    logits = logits + (1.0 - a) * 0.5 * (qk - kq)   # flux rows
+                if a > 0.0:
+                    logits = logits + a * 0.5 * (g_blk.unsqueeze(-1) - g.unsqueeze(-2))
+                logits = logits * scale + mask[rows]                # broadcast over (B,H)
+                return logits.softmax(dim=-1) @ vh
+
+            if torch.is_grad_enabled():
+                # Training: full (B,H,T,T) logits, identical to the validated path.
+                y = _hmap_block(qh, kh, m, g, slice(0, T))
+            else:
+                # Evaluation (bpb, CORE, generate): chunk query rows so the full
+                # T x T logits never materialize — fixes CORE-eval OOM at d12
+                # while training state is resident. Numerics identical (row-wise
+                # softmax is independent across query rows).
+                chunk = 256
+                outs = []
+                for s in range(0, T, chunk):
+                    rows = slice(s, min(s + chunk, T))
+                    outs.append(_hmap_block(
+                        qh[..., rows, :], kh[..., rows, :], m[..., rows, :],
+                        g[..., rows] if g is not None else None, rows))
+                y = torch.cat(outs, dim=-2)
+
+            y = y.transpose(1, 2).contiguous().view(B, T, -1)
             y = self.c_proj(y)
             return y
 
