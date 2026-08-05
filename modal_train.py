@@ -74,6 +74,10 @@ image = (
         {
             "PATH": "/root/.cargo/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin",
             "OMP_NUM_THREADS": "1",
+            # Plain HTTP transfer for HF up/downloads: the xet backend's
+            # background threads can linger after work completes and delay
+            # container shutdown by minutes.
+            "HF_HUB_DISABLE_XET": "1",
         }
     )
     .add_local_dir(
@@ -428,6 +432,8 @@ def train_nanochat(
         print(f"[modal_train] pushed {len(ops)} file(s) in one commit to "
               f"{hf_repo}/{hf_subfolder}/")
 
+    print("[modal_train] all done, returning. (Anything after this line is "
+          "platform teardown, not this script.)")
     return {"ok": True, "run": run_name, "hf_repo": hf_repo,
             "hf_subfolder": hf_subfolder}
 
