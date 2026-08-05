@@ -546,26 +546,32 @@ while True:
     # NOTE: Engine uses the kv-cache inference path, which HMAP does not
     # support — auto-skip sampling for non-standard attention variants.
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
         if args.attn_variant != "standard":
-            print0(f"[sample] skipped: Engine kv-cache sampling unsupported for attn_variant={args.attn_variant}")
+            # Engine's kv-cache path is unsupported for HMAP — use the naive
+            # cache-free generate() (full forward per token; cheap at 16 tokens).
+            with disable_fp8(orig_model):
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    out = list(orig_model.generate(tokens, max_tokens=16, temperature=0))
+                    print0(tokenizer.decode(tokens + out))
         else:
-            model.eval()
-            prompts = [
-                "The capital of France is",
-                "The chemical symbol of gold is",
-                "If yesterday was Friday, then tomorrow will be",
-                "The opposite of hot is",
-                "The planets of the solar system are:",
-                "My favorite color is",
-                "If 5*x + 3 = 13, then x is",
-            ]
             engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
                 with disable_fp8(orig_model):
                     sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 print0(tokenizer.decode(sample[0]))
-            model.train()
+        model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
