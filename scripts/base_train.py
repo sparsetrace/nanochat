@@ -39,6 +39,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
+from nanochat.icl_eval import icl_score, induction_score
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -497,6 +498,29 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
+        })
+        model.train()
+
+    # once in a while: ICL + induction evals (Olsson et al. style; see nanochat/icl_eval.py)
+    # ICL uses the compiled model (val-loader batches match training shapes);
+    # induction uses orig_model (different sequence length would retrigger compile).
+    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        model.eval()
+        with disable_fp8(model):
+            icl = icl_score(model, build_val_loader(), num_batches=8)
+        with disable_fp8(orig_model):
+            ind = induction_score(orig_model, vocab_size, device)
+        print0(f"Step {step:05d} | ICL early: {icl['early']:.4f} late: {icl['late']:.4f} "
+               f"score: {icl['score']:+.4f} | Induction loss: {ind['induction_loss']:.4f} "
+               f"acc: {ind['induction_acc']:.4f} (random-half: {ind['random_half_loss']:.4f})")
+        wandb_run.log({
+            "step": step,
+            "icl/early": icl["early"],
+            "icl/late": icl["late"],
+            "icl/score": icl["score"],
+            "induction/loss": ind["induction_loss"],
+            "induction/acc": ind["induction_acc"],
+            "induction/random_half_loss": ind["random_half_loss"],
         })
         model.train()
 
