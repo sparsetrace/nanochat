@@ -62,7 +62,7 @@ jobs:
           SAVE_EVERY: ${{ inputs.save_every }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
           HF_SUBFOLDER: DMAP
-          VARIANT_ARGS: "--attn-variant hmap --hmap-alpha 1.0 --device-batch-size=8"
+          VARIANT_ARGS: "--attn-variant hmap --hmap-alpha 1.0 --device-batch-size=8 --core-metric-every=-1"
         run: |
           python -c "
           import os, modal
