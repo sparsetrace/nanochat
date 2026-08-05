@@ -162,6 +162,12 @@ def _periodic_sync(stop: threading.Event, api, hf_repo: str, subfolder: str,
                     path_in_repo=f"{subfolder}/latest/{p.name}",
                     path_or_fileobj=str(p)))
                 names.append((p.name, mtime))
+            if stop.is_set():
+                # Training just finished — the final upload (main thread) owns
+                # everything from here. Do not start a multi-GB push that would
+                # keep the container alive after the run is done.
+                print("[modal_train] mirror cycle skipped (training finished)")
+                break
             if ops:
                 api.create_commit(repo_id=hf_repo, operations=ops,
                                   commit_message=f"mirror latest ({len(ops)} files)")
@@ -341,11 +347,12 @@ def train_nanochat(
 
     # ── Background: Volume commits + HF latest/ mirroring, every 15 min ─────
     stop = threading.Event()
-    threading.Thread(
+    sync_thread = threading.Thread(
         target=_periodic_sync,
         args=(stop, api, hf_repo, hf_subfolder, ckpt_dir),
         daemon=True,
-    ).start()
+    )
+    sync_thread.start()
 
     # ── Train ────────────────────────────────────────────────────────────────
     if NPROC > 1:
@@ -368,6 +375,12 @@ def train_nanochat(
         _run_streamed(cmd, log_path=log_path)
     finally:
         stop.set()
+        if sync_thread.is_alive():
+            print("[modal_train] waiting for background mirror cycle to finish...")
+            sync_thread.join(timeout=600)
+            if sync_thread.is_alive():
+                print("[modal_train] WARNING: mirror thread still busy after 10 min; "
+                      "proceeding anyway (daemon thread, container may linger briefly)")
         trained_steps = parse_log_to_csv(log_path, csv_path)
         ns = extract_samples(log_path, samples_path, run_name)
         print(f"[modal_train] parsed {trained_steps} step lines -> {csv_path}; "
