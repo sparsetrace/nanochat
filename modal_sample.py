@@ -167,7 +167,8 @@ def sample_checkpoint(
     print(f"[sample] {hf_repo}/{prefix} step {use_step} | "
           f"{len(prompt_list)} prompts x {num_samples} samples x {max_tokens} tokens")
     subprocess.run(
-        f"cd {REPO_DIR} && {VENV}/bin/python -u {workdir}/sample_script.py {workdir}/job.json",
+        f"cd {REPO_DIR} && PYTHONPATH={REPO_DIR} "
+        f"{VENV}/bin/python -u {workdir}/sample_script.py {workdir}/job.json",
         shell=True, check=True, executable="/bin/bash",
     )
 
