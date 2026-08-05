@@ -137,8 +137,10 @@ def extract_samples(log_path: Path, samples_path: Path, run_tag: str) -> int:
 
 def _periodic_sync(stop: threading.Event, api, hf_repo: str, subfolder: str,
                    local_ckpt_dir: Path, every_s: int = 900):
-    """Every 15 min: commit the Volume AND mirror the newest checkpoint files
-    to HF <subfolder>/latest/ (overwriting). Failures are logged, never fatal."""
+    """Every 15 min: commit the Volume AND mirror new/changed checkpoint files
+    to HF <subfolder>/latest/ in ONE commit per cycle (HF throttles per-commit,
+    not per-byte). Failures are logged, never fatal."""
+    from huggingface_hub import CommitOperationAdd
     pushed_mtimes = {}
     while not stop.wait(every_s):
         try:
@@ -149,19 +151,23 @@ def _periodic_sync(stop: threading.Event, api, hf_repo: str, subfolder: str,
         if api is None or not local_ckpt_dir.exists():
             continue
         try:
+            ops, names = [], []
             for p in sorted(local_ckpt_dir.iterdir()):
                 if not p.is_file():
                     continue
                 mtime = p.stat().st_mtime
                 if pushed_mtimes.get(p.name) == mtime:
                     continue  # unchanged since last push
-                api.upload_file(
-                    path_or_fileobj=str(p),
+                ops.append(CommitOperationAdd(
                     path_in_repo=f"{subfolder}/latest/{p.name}",
-                    repo_id=hf_repo,
-                )
-                pushed_mtimes[p.name] = mtime
-                print(f"[modal_train] mirrored {p.name} -> {subfolder}/latest/")
+                    path_or_fileobj=str(p)))
+                names.append((p.name, mtime))
+            if ops:
+                api.create_commit(repo_id=hf_repo, operations=ops,
+                                  commit_message=f"mirror latest ({len(ops)} files)")
+                for name, mtime in names:
+                    pushed_mtimes[name] = mtime
+                print(f"[modal_train] mirrored {len(ops)} file(s) -> {subfolder}/latest/")
         except Exception as e:
             print(f"[modal_train] HF mirror failed (non-fatal): {e}")
 
@@ -357,48 +363,56 @@ def train_nanochat(
         f"{extra_args}"
     )
     t0 = time.time()
+    trained_steps = 0
     try:
         _run_streamed(cmd, log_path=log_path)
     finally:
         stop.set()
-        n = parse_log_to_csv(log_path, csv_path)
+        trained_steps = parse_log_to_csv(log_path, csv_path)
         ns = extract_samples(log_path, samples_path, run_name)
-        print(f"[modal_train] parsed {n} step lines -> {csv_path}; "
+        print(f"[modal_train] parsed {trained_steps} step lines -> {csv_path}; "
               f"extracted {ns} samples -> {samples_path}")
         ckpt_vol.commit()
     print(f"[modal_train] training finished in {(time.time() - t0) / 3600:.2f} h")
 
-    # ── Final HF upload ──────────────────────────────────────────────────────
+    # ── Final HF upload (single batched commit to avoid HF commit throttling) ─
     if api is None:
         print("[modal_train] HF disabled — final artifacts remain on the Volume only.")
+    elif trained_steps == 0:
+        print("[modal_train] 0 training steps executed (already-complete resume?) — "
+              "skipping final upload, nothing new to push.")
     else:
-        # 1) latest/: full resume-capable set (model + meta + optim), overwrite
+        from huggingface_hub import CommitOperationAdd
+        ops = []
         if ckpt_dir.exists():
             for p in sorted(ckpt_dir.iterdir()):
                 if p.is_file():
-                    api.upload_file(path_or_fileobj=str(p),
-                                    path_in_repo=f"{hf_subfolder}/latest/{p.name}",
-                                    repo_id=hf_repo)
-            # 2) per-run archive: model + meta only (skip big optimizer states)
-            for p in sorted(ckpt_dir.iterdir()):
-                if p.is_file() and not p.name.startswith("optim_"):
-                    api.upload_file(
-                        path_or_fileobj=str(p),
-                        path_in_repo=f"{hf_subfolder}/checkpoints/{run_name}/{p.name}",
-                        repo_id=hf_repo)
+                    # latest/: full resume-capable set (model + meta + optim)
+                    ops.append(CommitOperationAdd(
+                        path_in_repo=f"{hf_subfolder}/latest/{p.name}",
+                        path_or_fileobj=str(p)))
+                    # per-run archive: model + meta only (skip optimizer states)
+                    if not p.name.startswith("optim_"):
+                        ops.append(CommitOperationAdd(
+                            path_in_repo=f"{hf_subfolder}/checkpoints/{run_name}/{p.name}",
+                            path_or_fileobj=str(p)))
         else:
             print(f"[modal_train] WARNING: no checkpoint dir at {ckpt_dir}, "
                   "skipping checkpoint upload")
-        # 3) logs + samples
         for p, dest in [
             (csv_path, f"{hf_subfolder}/logs/{run_name}_metrics.csv"),
             (log_path, f"{hf_subfolder}/logs/{run_name}_train.log"),
             (samples_path, f"{hf_subfolder}/samples/{run_name}_samples.txt"),
         ]:
             if p.exists():
-                api.upload_file(path_or_fileobj=str(p), path_in_repo=dest,
-                                repo_id=hf_repo)
-        print(f"[modal_train] pushed checkpoints + logs + samples to "
+                ops.append(CommitOperationAdd(path_in_repo=dest, path_or_fileobj=str(p)))
+        if ops:
+            api.create_commit(
+                repo_id=hf_repo,
+                operations=ops,
+                commit_message=f"run {run_name}: checkpoints + logs + samples",
+            )
+        print(f"[modal_train] pushed {len(ops)} file(s) in one commit to "
               f"{hf_repo}/{hf_subfolder}/")
 
     return {"ok": True, "run": run_name, "hf_repo": hf_repo,
