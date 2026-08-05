@@ -339,7 +339,8 @@ def train_nanochat(
     torchrun = f"{VENV}/bin/torchrun"
 
     _run_streamed(
-        f'{python} -c "import nanochat.gpt; '
+        f'{python} -u -c "print(\'[sanity] starting import...\', flush=True); '
+        f"import nanochat.gpt; "
         f"print('[sanity] gpt.py:', nanochat.gpt.__file__)\""
     )
     _run_streamed(f"{python} -m nanochat.dataset -n {data_shards}")
