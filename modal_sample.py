@@ -35,7 +35,17 @@ from pathlib import Path
 import modal
 
 # Reuse the training harness's image + volume so environments never diverge.
-from modal_train import image, ckpt_vol, CACHE_DIR, REPO_DIR, VENV, HF_REPO_DEFAULT
+# NOTE: the container re-imports this file at startup, so it must also be able
+# to import modal_train there — add_local_python_source ships that file's
+# source with the app (it is otherwise excluded from the baked image).
+import modal_train as _train
+
+ckpt_vol = _train.ckpt_vol
+CACHE_DIR = _train.CACHE_DIR
+REPO_DIR = _train.REPO_DIR
+VENV = _train.VENV
+HF_REPO_DEFAULT = _train.HF_REPO_DEFAULT
+image = _train.image.add_local_python_source("modal_train")
 
 app = modal.App("nanochat-sample")
 
