@@ -12,6 +12,19 @@ on:
         description: "Run name (checkpoints/logs/HF paths). Empty = d{depth}"
         required: false
         default: ""
+      resume:
+        description: "Resume policy: auto = continue if <variant>/latest/ matches this run_tag+depth; never; force"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
+        required: false
+        default: "auto"
+      add_steps:
+        description: "Additive step budget: fresh run trains N steps; relaunch trains N MORE. -1 = full compute-optimal horizon"
+        required: false
+        default: "-1"
       save_every:
         description: "Checkpoint every N steps"
         required: false
@@ -44,6 +57,8 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           DEPTH: ${{ inputs.depth }}
           RUN_TAG: ${{ inputs.run_tag }}
+          RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
           SAVE_EVERY: ${{ inputs.save_every }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
           HF_SUBFOLDER: DMAP
@@ -58,6 +73,8 @@ jobs:
               hf_subfolder=os.environ['HF_SUBFOLDER'],
               save_every=int(os.environ['SAVE_EVERY']),
               run_tag=os.environ['RUN_TAG'],
+              resume=os.environ['RESUME'],
+              add_steps=int(os.environ['ADD_STEPS']),
               extra_args=extra,
           )
           print('launched, call id:', call.object_id)
