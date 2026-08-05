@@ -12,6 +12,11 @@ on:
         description: "Run name (checkpoints/logs/HF paths). Empty = d{depth}"
         required: false
         default: ""
+      resume:
+        description: "Resume from <variant>/latest/ on HF (run_tag/depth/flags must match the original run)"
+        type: boolean
+        required: false
+        default: false
       save_every:
         description: "Checkpoint every N steps"
         required: false
@@ -44,6 +49,7 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           DEPTH: ${{ inputs.depth }}
           RUN_TAG: ${{ inputs.run_tag }}
+          RESUME: ${{ inputs.resume }}
           SAVE_EVERY: ${{ inputs.save_every }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
           HF_SUBFOLDER: attention
@@ -58,6 +64,7 @@ jobs:
               hf_subfolder=os.environ['HF_SUBFOLDER'],
               save_every=int(os.environ['SAVE_EVERY']),
               run_tag=os.environ['RUN_TAG'],
+              resume=os.environ['RESUME'] == 'true',
               extra_args=extra,
           )
           print('launched, call id:', call.object_id)
