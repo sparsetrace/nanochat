@@ -81,6 +81,9 @@ class GPTConfig:
     # Independent Witten potential diag(R W_W R^T) added to the exact sector.
     # Adds two Linear projections per attention block (parameter count changes).
     witten: bool = False
+    # Bidirectional attention (no causal mask) for MLM-style objectives.
+    # Use with window_pattern="L"; sliding windows become two-sided if set.
+    bidirectional: bool = False
 
 
 def norm(x):
@@ -121,6 +124,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_variant = config.attn_variant
         self.hmap_alpha = config.hmap_alpha
         self.witten = config.witten
+        self.bidirectional = config.bidirectional
         if self.attn_variant == "hmap":
             # HMAP builds flux and potential from q_j AND k_j per token/head.
             # Under GQA the kv heads don't align 1:1 with query heads, so the
@@ -147,18 +151,24 @@ class CausalSelfAttention(nn.Module):
         self._eager_mask_cache = {}
 
     def _get_eager_mask(self, T, window_size, device):
-        """Additive (-inf) mask reproducing FA3 semantics: causal + sliding
-        window with window_size=(left, right=0): i attends to j iff
-        i - left <= j <= i (left < 0 means unlimited)."""
+        """Additive (-inf) mask. Causal mode reproduces FA3 semantics:
+        window_size=(left, 0): i attends to j iff i - left <= j <= i.
+        Bidirectional mode: all pairs allowed (two-sided |i-j| <= left if a
+        finite window is set)."""
         left = window_size[0]
-        key = (T, left)
+        key = (T, left, self.bidirectional)
         mask = self._eager_mask_cache.get(key)
         if mask is None or mask.device != device:
             i = torch.arange(T, device=device).view(T, 1)
             j = torch.arange(T, device=device).view(1, T)
-            allowed = (j <= i)
-            if left >= 0:
-                allowed = allowed & (j >= i - left)
+            if self.bidirectional:
+                allowed = torch.ones(T, T, dtype=torch.bool, device=device)
+                if left >= 0 and left < T:
+                    allowed = (j - i).abs() <= left
+            else:
+                allowed = (j <= i)
+                if left >= 0:
+                    allowed = allowed & (j >= i - left)
             mask = torch.zeros(T, T, device=device, dtype=torch.float32)
             mask.masked_fill_(~allowed, float("-inf"))
             mask = mask.to(COMPUTE_DTYPE)
@@ -237,11 +247,16 @@ class CausalSelfAttention(nn.Module):
             return y
 
         # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # Causal: window_size (left, right) = (N, 0). Bidirectional (MLM):
+        # causal=False and a fully open window (right=0 would still hide the
+        # future, so it must be lifted).
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if self.bidirectional:
+                y = flash_attn.flash_attn_func(q, k, v, causal=False, window_size=(-1, -1))
+            else:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
+            assert not self.bidirectional, "kv-cache inference is causal-only"
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
