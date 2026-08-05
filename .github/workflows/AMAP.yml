@@ -9,9 +9,9 @@ on:
         required: false
         default: "12"
       run_tag:
-        description: "Run name (checkpoints/logs/HF paths). Empty = d{depth}"
+        description: "Run name (checkpoints/logs/HF paths)"
         required: false
-        default: ""
+        default: "d12-a00"
       resume:
         description: "Resume policy: auto = continue if <variant>/latest/ matches this run_tag+depth; never; force"
         type: choice
