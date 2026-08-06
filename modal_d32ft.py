@@ -423,8 +423,9 @@ def train_d32ft(
     api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
 
     # The published d32 embedding/unembedding rows correspond to this tokenizer.
+    print("[d32ft] stage: installing exact Karpathy d32 tokenizer...", flush=True)
     _ensure_source_tokenizer()
-    ckpt_vol.commit()
+    print("[d32ft] stage complete: tokenizer ready", flush=True)
 
     ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_tag
     logs_dir = Path(CACHE_DIR) / "logs"
@@ -442,7 +443,17 @@ def train_d32ft(
 
     restored = None
     if resume != "never":
+        print(
+            f"[d32ft] stage: checking {hf_repo} for a resume-capable checkpoint...",
+            flush=True,
+        )
         restored = _restore_own_checkpoint(api, hf_repo, token, run_tag)
+        if restored is None:
+            print("[d32ft] stage complete: no own checkpoint found", flush=True)
+        else:
+            print("[d32ft] stage complete: own checkpoint found", flush=True)
+    else:
+        print("[d32ft] resume='never' — skipping own-checkpoint lookup", flush=True)
 
     if restored is not None:
         resumed_step, ckpt_dir = restored
@@ -456,7 +467,12 @@ def train_d32ft(
         if ckpt_dir.exists():
             shutil.rmtree(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[d32ft] stage: downloading Karpathy d32 seed ({SOURCE_MODEL})...",
+            flush=True,
+        )
         seed_model = _download_karpathy_seed()
+        print("[d32ft] stage complete: Karpathy d32 seed ready", flush=True)
         init_flag = f"--init-from-model={seed_model} "
         origin = f"{SOURCE_REPO}:{SOURCE_MODEL}"
         print(
@@ -470,10 +486,22 @@ def train_d32ft(
     # Historical d32 used 240 downloaded shards. This invokes your fork's
     # current nanochat.dataset implementation; pin the historical nanochat
     # commit if you need byte-for-byte reproduction of the 2025 corpus.
+    print(
+        f"[d32ft] stage: ensuring {data_shards} nanochat dataset shards are available...",
+        flush=True,
+    )
     _run_streamed(f"{python} -m nanochat.dataset -n {data_shards}")
-    ckpt_vol.commit()
+    print("[d32ft] stage complete: dataset ready", flush=True)
 
+    print(
+        "[d32ft] stage: installing ephemeral weights-only warmstart trainer...",
+        flush=True,
+    )
     trainer_module = _install_warmstart_train_module()
+    print(
+        f"[d32ft] stage complete: trainer module = {trainer_module}",
+        flush=True,
+    )
 
     stop = threading.Event()
     sync_thread = threading.Thread(
@@ -504,10 +532,16 @@ def train_d32ft(
         f"{extra_args}"
     )
 
-    print(f"[d32ft] origin: {origin}")
+    print(f"[d32ft] origin: {origin}", flush=True)
     print(
         f"[d32ft] additive budget: {add_steps} new steps "
-        f"({resumed_step} -> {horizon})"
+        f"({resumed_step} -> {horizon})",
+        flush=True,
+    )
+    print(
+        "[d32ft] stage: launching depth-32 AMAP training process "
+        "(model load / torch.compile can take a while)...",
+        flush=True,
     )
 
     t0 = time.time()
