@@ -1,0 +1,133 @@
+# .github/workflows/d32ft.yml
+name: Recondition nanochat d32 (AMAP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run/checkpoint identity"
+        required: false
+        default: "d32ft-amap"
+
+      resume:
+        description: "auto=own ckpt else Karpathy; never=re-bootstrap; force=require own ckpt"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
+        required: false
+        default: "auto"
+
+      num_gpus:
+        description: "H100 count"
+        required: false
+        default: "8"
+
+      add_steps:
+        description: "NEW optimization steps this launch"
+        required: false
+        default: "1000"
+
+      save_every:
+        description: "Checkpoint every N steps"
+        required: false
+        default: "250"
+
+      data_shards:
+        description: "nanochat base-data shards to ensure downloaded"
+        required: false
+        default: "240"
+
+      extra_args:
+        description: "Override/append base_train flags"
+        required: false
+        default: ""
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy d32ft app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+        run: modal deploy modal_d32ft.py
+
+      - name: Spawn d32 AMAP reconditioning
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: sparsetrace/d32ft
+          RUN_TAG: ${{ inputs.run_tag }}
+          RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
+          SAVE_EVERY: ${{ inputs.save_every }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+
+          # modal_d32ft.py hardcodes:
+          #   depth=32
+          #   window_pattern=L
+          #
+          # HMAP alpha=0 is AMAP. The initial state_dict load is strict=True,
+          # enforcing the "same W_Q/W_K, zero new parameters" ansatz.
+          #
+          # These LRs are deliberately 0.1x-ish scratch-pretraining values.
+          # Weight decay is disabled during reconditioning. Warmdown is disabled
+          # so relaunching an additive Modal chunk does not move the LR endpoint.
+          #
+          # 524288 tokens/step matches Karpathy's historical d32 effective batch.
+          VARIANT_ARGS: >-
+            --attn-variant=hmap
+            --hmap-alpha=0.0
+            --device-batch-size=1
+            --total-batch-size=524288
+            --embedding-lr=0.03
+            --unembedding-lr=0.0008
+            --matrix-lr=0.002
+            --scalar-lr=0.05
+            --weight-decay=0.0
+            --warmup-steps=40
+            --warmdown-ratio=0.0
+            --final-lr-frac=1.0
+            --core-metric-every=-1
+            --sample-every=250
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-d32ft", "train_d32ft")
+
+          extra = (
+              os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
+          ).strip()
+
+          call = f.spawn(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              resume=os.environ["RESUME"],
+              add_steps=int(os.environ["ADD_STEPS"]),
+              save_every=int(os.environ["SAVE_EVERY"]),
+              data_shards=int(os.environ["DATA_SHARDS"]),
+              extra_args=extra,
+          )
+
+          print("launched, call id:", call.object_id)
+          PY
