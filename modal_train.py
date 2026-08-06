@@ -39,8 +39,11 @@ import modal
 
 app = modal.App("nanochat")
 
-GPU_CONFIG = "H100"       # Hopper: FA3 supported. For multi-GPU use e.g. "H100:8"
-NPROC = 1                 # keep in sync with GPU_CONFIG; >1 switches to torchrun
+# Number of GPUs is fixed at DEPLOY time (Modal function defs are static).
+# Workflows set NUM_GPUS in the deploy step's env; default 1.
+NUM_GPUS = int(os.environ.get("NUM_GPUS", "1"))
+GPU_CONFIG = "H100" if NUM_GPUS == 1 else f"H100:{NUM_GPUS}"       # Hopper: FA3 supported. For multi-GPU use e.g. "H100:8"
+NPROC = NUM_GPUS          # torchrun ranks = GPUs; >1 switches launcher to torchrun
 
 HF_REPO_DEFAULT = "sparsetrace/nanochat"
 
@@ -85,9 +88,10 @@ image = (
         remote_path=REPO_DIR,
         copy=True,
         ignore=[".git", ".venv", "__pycache__", "*.pyc", ".github",
-                "modal_train.py"],  # harness runs from the deploy-time checkout,
-                                    # not inside the image — excluding it means
-                                    # harness edits don't rebuild the image
+                "modal_train.py", "modal_sample.py", "modal_eval.py"],
+                                    # harness files run from the deploy-time
+                                    # checkout, not inside the image — editing
+                                    # them must not rebuild it
     )
     .run_commands(f"cd {REPO_DIR} && uv sync --extra gpu")
 )
@@ -249,8 +253,8 @@ def _run_streamed(cmd: str, log_path: Path | None = None):
 @app.function(
     image=image,
     gpu=GPU_CONFIG,
-    cpu=8,
-    memory=32768,
+    cpu=8 * NUM_GPUS,
+    memory=32768 * NUM_GPUS,
     timeout=24 * 60 * 60,   # Modal's max
     retries=0,
     scaledown_window=5,     # tear the container down ~immediately after return
