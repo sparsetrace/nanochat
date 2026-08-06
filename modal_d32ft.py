@@ -30,9 +30,7 @@ import modal
 
 app = modal.App("nanochat-d32ft")
 
-NUM_GPUS = int(os.environ.get("NUM_GPUS", "8"))
-GPU_CONFIG = "H100" if NUM_GPUS == 1 else f"H100:{NUM_GPUS}"
-NPROC = NUM_GPUS
+GPU_CONFIG = "H100"  # overridden per invocation by Function.with_options(...)
 
 HF_REPO_DEFAULT = "sparsetrace/d32ft"
 SOURCE_REPO = "karpathy/nanochat-d32"
@@ -390,8 +388,8 @@ def _periodic_sync(
 @app.function(
     image=image,
     gpu=GPU_CONFIG,
-    cpu=8 * NUM_GPUS,
-    memory=32768 * NUM_GPUS,
+    cpu=32,
+    memory=131072,
     timeout=24 * 60 * 60,
     retries=0,
     scaledown_window=5,
@@ -401,6 +399,7 @@ def _periodic_sync(
 def train_d32ft(
     hf_repo: str = HF_REPO_DEFAULT,
     run_tag: str = "d32ft-amap",
+    num_gpus: int = 1,
     resume: str = "auto",
     add_steps: int = 1000,
     save_every: int = 250,
@@ -411,8 +410,26 @@ def train_d32ft(
         raise ValueError("d32ft requires add_steps > 0")
     if resume not in {"auto", "never", "force"}:
         raise ValueError("resume must be auto|never|force")
+    if num_gpus not in {1, 2, 4, 8}:
+        raise ValueError("num_gpus must be one of 1, 2, 4, 8")
 
     os.chdir(REPO_DIR)
+
+    import torch
+    visible_gpus = torch.cuda.device_count()
+    print(
+        f"[d32ft] GPU sanity: requested={num_gpus}, "
+        f"visible={visible_gpus}, CUDA_VISIBLE_DEVICES="
+        f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+        flush=True,
+    )
+    if visible_gpus != num_gpus:
+        raise RuntimeError(
+            f"Modal GPU provisioning mismatch: requested {num_gpus} GPU(s), "
+            f"but torch sees {visible_gpus}. Refusing to launch torchrun with "
+            f"an invalid local world size."
+        )
+    nproc = visible_gpus
     token = os.environ.get("HF_TOKEN", "")
     if not token:
         raise RuntimeError("HF_TOKEN is required for sparsetrace/d32ft")
@@ -511,9 +528,9 @@ def train_d32ft(
     )
     sync_thread.start()
 
-    if NPROC > 1:
+    if nproc > 1:
         launcher = (
-            f"{torchrun} --standalone --nproc_per_node={NPROC} "
+            f"{torchrun} --standalone --nproc_per_node={nproc} "
             f"-m {trainer_module} --"
         )
     else:
@@ -571,7 +588,7 @@ def train_d32ft(
                 "resumed_step": resumed_step,
                 "horizon": horizon,
                 "new_steps_requested": add_steps,
-                "num_gpus": NPROC,
+                "num_gpus": nproc,
                 "data_shards_requested": data_shards,
                 "extra_args": extra_args,
             },
