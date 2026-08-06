@@ -64,7 +64,6 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          NUM_GPUS: ${{ inputs.num_gpus }}
         run: modal deploy modal_d32ft.py
 
       - name: Spawn d32 AMAP reconditioning
@@ -74,6 +73,7 @@ jobs:
 
           HF_REPO: sparsetrace/d32ft
           RUN_TAG: ${{ inputs.run_tag }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
           RESUME: ${{ inputs.resume }}
           ADD_STEPS: ${{ inputs.add_steps }}
           SAVE_EVERY: ${{ inputs.save_every }}
@@ -115,13 +115,18 @@ jobs:
 
           f = modal.Function.from_name("nanochat-d32ft", "train_d32ft")
 
+          num_gpus = int(os.environ["NUM_GPUS"])
+          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
           extra = (
               os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
           ).strip()
 
+          f = f.with_options(gpu=gpu_request)
+
           call = f.spawn(
               hf_repo=os.environ["HF_REPO"],
               run_tag=os.environ["RUN_TAG"],
+              num_gpus=num_gpus,
               resume=os.environ["RESUME"],
               add_steps=int(os.environ["ADD_STEPS"]),
               save_every=int(os.environ["SAVE_EVERY"]),
