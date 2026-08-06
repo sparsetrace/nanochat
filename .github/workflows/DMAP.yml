@@ -21,6 +21,10 @@ on:
           - force
         required: false
         default: "auto"
+      num_gpus:
+        description: "GPUs (H100s) for this run; >1 uses torchrun DDP"
+        required: false
+        default: "1"
       add_steps:
         description: "Additive step budget: fresh run trains N steps; relaunch trains N MORE. -1 = full compute-optimal horizon"
         required: false
@@ -50,6 +54,7 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
         run: modal deploy modal_train.py
       - name: Spawn training (fire-and-forget)
         env:
