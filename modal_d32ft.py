@@ -363,7 +363,9 @@ def _checkpoint_steps(files: list[str], prefix: str) -> list[int]:
         m = re.fullmatch(r"meta_(\d+)\.json", name)
         if m:
             meta_steps.add(int(m.group(1)))
-        m = re.fullmatch(r"optim_(\d+)\.pt", name)
+        # DDP runs save per-rank optimizer files (optim_000100_rank0.pt ...);
+        # single-GPU runs save optim_000100.pt. Accept both.
+        m = re.fullmatch(r"optim_(\d+)(?:_rank\d+)?\.pt", name)
         if m:
             optim_steps.add(int(m.group(1)))
     return sorted(model_steps & meta_steps & optim_steps)
@@ -393,21 +395,21 @@ def _restore_own_checkpoint(api, hf_repo: str, token: str, run_name: str):
 
     ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    wanted = {
-        f"model_{chosen_step:06d}.pt",
-        f"meta_{chosen_step:06d}.json",
-        f"optim_{chosen_step:06d}.pt",
-    }
+    step_token = f"{chosen_step:06d}"
 
     for repo_file in files:
-        if repo_file.startswith(chosen_prefix) and Path(repo_file).name in wanted:
+        name = Path(repo_file).name
+        if repo_file.startswith(chosen_prefix) and step_token in name and (
+            name.startswith("model_") or name.startswith("meta_")
+            or name.startswith("optim_")
+        ):
             cached = hf_hub_download(
                 repo_id=hf_repo,
                 filename=repo_file,
                 token=token,
                 local_dir=str(Path(CACHE_DIR) / "hf_resume"),
             )
-            shutil.copy2(cached, ckpt_dir / Path(repo_file).name)
+            shutil.copy2(cached, ckpt_dir / name)
 
     meta = json.loads((ckpt_dir / f"meta_{chosen_step:06d}.json").read_text())
     uc = meta.get("user_config", {}) or {}
