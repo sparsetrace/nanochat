@@ -20,7 +20,7 @@ on:
         default: "auto"
 
       num_gpus:
-        description: "H100 count"
+        description: "H100 count (8 = one optimizer step per 8 accum micro-steps at batch 4; 1-GPU d32 is a multi-day slog)"
         required: false
         default: "8"
 
@@ -30,17 +30,17 @@ on:
         default: "1000"
 
       save_every:
-        description: "Checkpoint every N steps"
+        description: "Checkpoint every N steps (~1-2h apart at 8xH100 d32-eager)"
         required: false
-        default: "250"
+        default: "100"
 
       data_shards:
-        description: "nanochat base-data shards to ensure downloaded"
+        description: "nanochat base-data shards to ensure downloaded (1000 steps x 0.5M tokens needs ~15; 60 gives headroom)"
         required: false
-        default: "240"
+        default: "60"
 
       extra_args:
-        description: "Override/append base_train flags"
+        description: "Override/append base_train flags (argparse last-wins over VARIANT_ARGS)"
         required: false
         default: ""
 
@@ -84,8 +84,17 @@ jobs:
           #   depth=32
           #   window_pattern=L
           #
-          # HMAP alpha=0 is AMAP. The initial state_dict load is strict=True,
-          # enforcing the "same W_Q/W_K, zero new parameters" ansatz.
+          # HMAP alpha=0 is AMAP; the warm start loads Karpathy's weights with
+          # vintage-aware allowlisting and graft-neutral scalar overrides.
+          #
+          # --device-batch-size=4: an 80GB H100 is massively underutilized at
+          # batch 1 (d12-AMAP at batch 8 peaked at 15.4GB); batch 4 cuts grad
+          # accumulation 4x. If it OOMs (visible in the first minutes), rerun
+          # with extra_args: --device-batch-size=2
+          #
+          # At 8xH100 + batch 4: 524288/(8*4*2048) = 16 accum micro-steps per
+          # optimizer step. At 1 GPU + batch 1 it would be 256 — a multi-day,
+          # many-resume slog for the same dollars.
           #
           # These LRs are deliberately 0.1x-ish scratch-pretraining values.
           # Weight decay is disabled during reconditioning. Warmdown is disabled
@@ -95,7 +104,7 @@ jobs:
           VARIANT_ARGS: >-
             --attn-variant=hmap
             --hmap-alpha=0.0
-            --device-batch-size=1
+            --device-batch-size=4
             --total-batch-size=524288
             --embedding-lr=0.03
             --unembedding-lr=0.0008
