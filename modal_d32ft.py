@@ -266,18 +266,38 @@ elif args.init_from_model:
         "[d32ft] shape mismatch — wrong tokenizer or model config for this checkpoint"
     assert not _unexpected, \
         "[d32ft] checkpoint contains keys this model lacks — config mismatch"
-    _ALLOW = ("value_embed",)
+    _ALLOW = ("value_embed", "ve_gate", "resid_lambda", "x0_lambda",
+              "smear_gate", "smear_lambda", "backout_lambda")
     _bad_missing = [
         _k for _k in _missing if not any(_a in _k for _a in _ALLOW)
     ]
     assert not _bad_missing, \
         f"[d32ft] missing keys outside the vintage allowlist: {_bad_missing}"
     model.load_state_dict(_init_state, strict=False)
+    # Policy for vintage-absent modules:
+    #  - value_embeds TABLES: zero them (additive content; zero = no
+    #    contribution, deterministic).
+    #  - scalars/gates (resid_lambdas, x0_lambdas, ve_gate, smear_*,
+    #    backout_*): KEEP init_weights() values — these features are
+    #    initialized neutral-by-design (gates closed, residual scales at
+    #    identity); zeroing e.g. resid_lambdas could kill the residual
+    #    stream. We print their post-init values so neutrality is verifiable
+    #    in the log.
     with torch.no_grad():
         for _k, _p in model.named_parameters():
-            if _k in _missing:
+            if _k not in _missing:
+                continue
+            if "value_embeds" in _k:
                 _p.zero_()
-                print0(f"[d32ft]   zero-initialized (vintage-absent): {_k}")
+                print0(f"[d32ft]   zero-initialized VE table: {_k}")
+            else:
+                _flat = _p.detach().float().flatten()
+                _preview = ", ".join(f"{v:.3f}" for v in _flat[:8].tolist())
+                _suffix = ", ..." if _flat.numel() > 8 else ""
+                print0(f"[d32ft]   kept init (verify neutral!): {_k} "
+                       f"shape={tuple(_p.shape)} "
+                       f"mean={_flat.mean().item():.4f} "
+                       f"values=[{_preview}{_suffix}]")
     del _init_state, _own
 """
     text = text.replace(load_anchor, load_anchor + warmstart, 1)
