@@ -869,6 +869,132 @@ def train_d32ft(
     }
 
 
+# ── CORE evaluation: original Karpathy d32 AND converted AMAP checkpoints ───
+CORE_EVAL_PY = r'''
+import json, sys, torch
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.tokenizer import get_tokenizer
+from nanochat.common import compute_init
+
+cfg = json.load(open(sys.argv[1]))
+template = json.load(open(cfg["template_meta"]))["model_config"]
+template["attn_variant"] = cfg["attn_variant"]
+print(f"[d32-core] source={cfg['source']} attn_variant={cfg['attn_variant']}",
+      flush=True)
+
+ddp, rank, local_rank, world, device = compute_init("cuda")
+
+model = GPT(GPTConfig(**template)).to(device)
+state = torch.load(cfg["model_path"], map_location=device, weights_only=True)
+own = model.state_dict()
+missing = sorted(set(own) - set(state))
+unexpected = sorted(set(state) - set(own))
+assert not unexpected, f"unexpected keys: {unexpected[:5]}"
+ALLOW = ("value_embed", "ve_gate", "resid_lambda", "x0_lambda",
+         "smear_gate", "smear_lambda", "backout_lambda")
+bad = [k for k in missing if not any(a in k for a in ALLOW)]
+assert not bad, f"missing keys outside vintage allowlist: {bad[:5]}"
+model.load_state_dict(state, strict=False)
+with torch.no_grad():
+    for k, p in model.named_parameters():
+        if k not in missing:
+            continue
+        if "value_embeds" in k:
+            p.zero_()
+        elif "resid_lambda" in k:
+            p.fill_(1.0)
+        elif "x0_lambda" in k or "backout_lambda" in k:
+            p.zero_()
+model.eval()
+
+tokenizer = get_tokenizer()
+from scripts.base_eval import evaluate_core
+core = evaluate_core(model, tokenizer, device,
+                     max_per_task=cfg["max_per_task"])
+result = {
+    "source": cfg["source"],
+    "attn_variant": cfg["attn_variant"],
+    "core_metric": core["core_metric"],
+    "centered_results": core["centered_results"],
+}
+print(f"[d32-core] CORE metric: {core['core_metric']:.4f}", flush=True)
+with open(cfg["out_path"], "w") as f:
+    json.dump(result, f, indent=2)
+print(f"[d32-core] wrote {cfg['out_path']}", flush=True)
+'''
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    cpu=8,
+    memory=65536,
+    timeout=4 * 60 * 60,
+    scaledown_window=5,
+    volumes={CACHE_DIR: ckpt_vol},
+    secrets=[hf_secret],
+)
+def core_eval_d32(
+    source: str = "converted",   # "converted" (AMAP) | "original" (Karpathy seed)
+    hf_repo: str = HF_REPO_DEFAULT,
+    run_tag: str = "d32ft-amap",
+    step: int = -1,              # converted only: -1 = newest on Volume
+    max_per_task: int = 500,
+) -> dict:
+    """CORE metric (22-task capability suite) on a fresh GPU. 'original' =
+    Karpathy seed under standard attention (FA3, fast); 'converted' = AMAP
+    checkpoint via the chunked eager eval path (slow: budget ~1-2h).
+    Identical vintage handling to the trainer/probe/sampler, so all four
+    tools measure the same pair of functions."""
+    from huggingface_hub import HfApi
+
+    token = os.environ.get("HF_TOKEN", "")
+    api = HfApi(token=token) if token else None
+    _ensure_source_tokenizer()
+    ckpt_vol.reload()
+
+    ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_tag
+    local_names = ([p.name for p in ckpt_dir.iterdir() if p.is_file()]
+                   if ckpt_dir.exists() else [])
+    steps = _checkpoint_steps(local_names, "")
+    assert steps, f"no converted checkpoint on Volume under {ckpt_dir}"
+    tmpl_step = step if (step > 0 and step in steps) else steps[-1]
+    template_meta = ckpt_dir / f"meta_{tmpl_step:06d}.json"
+
+    if source == "original":
+        model_path = _download_karpathy_seed()
+        attn_variant = "standard"
+        label = "original"
+    else:
+        model_path = ckpt_dir / f"model_{tmpl_step:06d}.pt"
+        attn_variant = "hmap"
+        label = f"{run_tag}-step{tmpl_step}"
+
+    workdir = Path("/tmp/d32_core")
+    workdir.mkdir(parents=True, exist_ok=True)
+    out_path = workdir / f"{label}_core.json"
+    job = {
+        "source": source, "attn_variant": attn_variant,
+        "template_meta": str(template_meta), "model_path": str(model_path),
+        "max_per_task": max_per_task, "out_path": str(out_path),
+    }
+    (workdir / "job.json").write_text(json.dumps(job))
+    (workdir / "core_script.py").write_text(CORE_EVAL_PY)
+
+    _run_streamed(
+        f"cd {REPO_DIR} && PYTHONPATH={REPO_DIR} "
+        f"{VENV}/bin/python -u {workdir}/core_script.py {workdir}/job.json"
+    )
+
+    if api is not None:
+        dest = f"evals/{label}_core.json"
+        api.upload_file(path_or_fileobj=str(out_path), path_in_repo=dest,
+                        repo_id=hf_repo)
+        print(f"[d32-core] uploaded -> {hf_repo}/{dest}")
+    print("[d32-core] all done, returning.")
+    return json.loads(out_path.read_text())
+
+
 # ── Sampling: original Karpathy d32 AND converted AMAP checkpoints ──────────
 SAMPLE_PY = r'''
 import json, sys, torch
