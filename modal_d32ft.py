@@ -14,6 +14,19 @@ LATER launches:
 
 The checked-in scripts/base_train.py is not modified. At runtime we create an
 ephemeral scripts/_d32ft_base_train.py that adds one --init-from-model argument.
+
+VINTAGE NOTE (why the warm start is strict-with-allowlist, not strict=True):
+the published checkpoint is Oct-2025 architecture. Its 1.9B params are fully
+accounted for by matrices + wte/lm_head at vocab 65,536 — it has NO
+value_embeds, which this fork's model does have. Missing keys are therefore
+expected, but ONLY on the value_embeds allowlist; anything else aborts.
+Missing value-embedding tables are ZEROED after load so their contribution
+vanishes: the grafted model then differs from the source by the AMAP operator
+alone, which is the ansatz semantics we want to measure.
+
+IMPORTANT harness constraint: this function runs under the container's SYSTEM
+python (modal + huggingface_hub only). torch exists ONLY inside the repo venv;
+any torch work must happen in a subprocess under {VENV}/bin/python.
 """
 
 import csv
@@ -119,6 +132,20 @@ def _run_streamed(cmd: str, log_path: Path | None = None):
         raise RuntimeError(f"command failed with exit code {proc.returncode}: {cmd}")
 
 
+def _count_visible_gpus() -> int:
+    """GPU probe via the repo venv. The harness process itself has no torch
+    (system python), so `import torch` here would ModuleNotFoundError — all
+    torch work belongs in subprocesses under the venv interpreter."""
+    probe = subprocess.run(
+        [f"{VENV}/bin/python", "-c",
+         "import torch; print(torch.cuda.device_count())"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"GPU probe failed: {probe.stderr.strip()}")
+    return int(probe.stdout.strip())
+
+
 def parse_log_to_csv(log_path: Path, csv_path: Path) -> int:
     rows = []
     if log_path.exists():
@@ -204,19 +231,54 @@ def _install_warmstart_train_module() -> str:
             "Could not patch base_train.py: checkpoint load anchor changed."
         )
 
+    # Strict-with-allowlist warm start (see VINTAGE NOTE in module docstring):
+    #  - unexpected keys        -> hard error (checkpoint has things we lack)
+    #  - shape mismatches       -> hard error (wrong tokenizer/config)
+    #  - missing keys           -> hard error UNLESS on the value_embed
+    #                              allowlist (known Oct-2025 vintage drift)
+    #  - allowlisted missing    -> loaded model keeps them, then we ZERO them,
+    #                              so the graft differs from the source by the
+    #                              AMAP operator alone (no fresh-init noise).
     warmstart = r"""
 elif args.init_from_model:
     print0(f"[d32ft] Weights-only warm start from {args.init_from_model}")
     print0("[d32ft] New optimizer + new dataloader state; local step starts at 0")
-    model_data = torch.load(
+    _init_state = torch.load(
         args.init_from_model,
         map_location=device,
         weights_only=True,
     )
-    # AMAP is parameter-identical to standard attention. Any key mismatch is
-    # therefore a hard error, not something to paper over with strict=False.
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data
+    _own = model.state_dict()
+    _missing = sorted(set(_own) - set(_init_state))
+    _unexpected = sorted(set(_init_state) - set(_own))
+    for _k in _missing:
+        print0(f"[d32ft]   missing from checkpoint: {_k}")
+    for _k in _unexpected:
+        print0(f"[d32ft]   unexpected in checkpoint: {_k}")
+    _shape_bad = [
+        (_k, tuple(_init_state[_k].shape), tuple(_own[_k].shape))
+        for _k in set(_own) & set(_init_state)
+        if tuple(_init_state[_k].shape) != tuple(_own[_k].shape)
+    ]
+    for _k, _cs, _ms in _shape_bad:
+        print0(f"[d32ft]   SHAPE MISMATCH: {_k} ckpt{_cs} vs model{_ms}")
+    assert not _shape_bad, \
+        "[d32ft] shape mismatch — wrong tokenizer or model config for this checkpoint"
+    assert not _unexpected, \
+        "[d32ft] checkpoint contains keys this model lacks — config mismatch"
+    _ALLOW = ("value_embed",)
+    _bad_missing = [
+        _k for _k in _missing if not any(_a in _k for _a in _ALLOW)
+    ]
+    assert not _bad_missing, \
+        f"[d32ft] missing keys outside the vintage allowlist: {_bad_missing}"
+    model.load_state_dict(_init_state, strict=False)
+    with torch.no_grad():
+        for _k, _p in model.named_parameters():
+            if _k in _missing:
+                _p.zero_()
+                print0(f"[d32ft]   zero-initialized (vintage-absent): {_k}")
+    del _init_state, _own
 """
     text = text.replace(load_anchor, load_anchor + warmstart, 1)
     dst.write_text(text)
@@ -370,6 +432,7 @@ def _periodic_sync(
                 names.append((p.name, mtime))
 
             if stop.is_set():
+                print("[d32ft] mirror cycle skipped (training finished)")
                 break
 
             if ops:
@@ -415,8 +478,8 @@ def train_d32ft(
 
     os.chdir(REPO_DIR)
 
-    import torch
-    visible_gpus = torch.cuda.device_count()
+    # GPU sanity via the venv (the harness process has no torch — see docstring)
+    visible_gpus = _count_visible_gpus()
     print(
         f"[d32ft] GPU sanity: requested={num_gpus}, "
         f"visible={visible_gpus}, CUDA_VISIBLE_DEVICES="
@@ -568,11 +631,28 @@ def train_d32ft(
     finally:
         stop.set()
         if sync_thread.is_alive():
+            print("[d32ft] waiting for background mirror cycle to finish...")
             sync_thread.join(timeout=600)
         trained_rows = parse_log_to_csv(log_path, csv_path)
-        parse_icl_to_csv(log_path, icl_csv_path)
-        extract_samples(log_path, samples_path, run_tag)
+        n_icl = parse_icl_to_csv(log_path, icl_csv_path)
+        ns = extract_samples(log_path, samples_path, run_tag)
+        print(f"[d32ft] parsed {trained_rows} step lines; {n_icl} ICL lines; "
+              f"{ns} samples")
         ckpt_vol.commit()
+
+    # Zero-step guard: a resume that had nothing left to do re-saves an
+    # identical checkpoint; re-pushing ~20GB of d32 artifacts helps no one.
+    # (Bootstrap runs always push: even at low step counts the grafted
+    # checkpoint + step-0 eval logs are the point of the exercise.)
+    if trained_rows == 0 and resume_flag:
+        print("[d32ft] 0 training steps on a resume — skipping final upload.")
+        print("[d32ft] all done, returning. (Anything after this line is "
+              "platform teardown, not this script.)")
+        return {
+            "ok": True, "run": run_tag, "hf_repo": hf_repo, "origin": origin,
+            "start_step": resumed_step, "end_step": resumed_step,
+            "parsed_training_lines": 0,
+        }
 
     provenance_path = logs_dir / f"{run_tag}_provenance.json"
     provenance_path.write_text(
@@ -636,6 +716,8 @@ def train_d32ft(
 
     elapsed_h = (time.time() - t0) / 3600
     print(f"[d32ft] finished in {elapsed_h:.2f} h")
+    print("[d32ft] all done, returning. (Anything after this line is "
+          "platform teardown, not this script.)")
     return {
         "ok": True,
         "run": run_tag,
