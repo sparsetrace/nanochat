@@ -926,7 +926,7 @@ print(f"[d32-core] wrote {cfg['out_path']}", flush=True)
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     cpu=8,
     memory=65536,
     timeout=4 * 60 * 60,
