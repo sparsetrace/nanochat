@@ -317,11 +317,61 @@ def fig_core_fingerprint():
     savefig(fig, "fig_core_fingerprint")
 
 
+def collect_samples():
+    """Pull the five temperature-sample .txt files into figures/samples/ so
+    the workflow commits them to the repo: d12 trio (main repo, uploaded by
+    modal_sample as {variant}/samples/{tag}_step{N}_sampled.txt) + the d32
+    pair (d32ft repo). Tolerant: missing files WARN and are skipped."""
+    sdir = OUT / "samples"
+    sdir.mkdir(exist_ok=True)
+    got = 0
+
+    # d12 trio: find the newest step's sampled file per variant.
+    d12 = [("attention", "d12-base"), ("AMAP", "d12-a00"),
+           ("DMAP", "d12-a10")]
+    try:
+        main_files = API.list_repo_files(repo_id=MAIN)
+    except Exception as e:
+        warn(f"cannot list {MAIN}: {e}")
+        main_files = []
+    for sub, tag in d12:
+        pat = re.compile(
+            rf"{re.escape(sub)}/samples/{re.escape(tag)}_step(\d+)_sampled\.txt")
+        hits = [(int(m.group(1)), f) for f in main_files
+                if (m := pat.fullmatch(f))]
+        if not hits:
+            warn(f"no temperature samples yet for {tag} "
+                 f"(run sample.yml for {sub})")
+            continue
+        _, path = max(hits)
+        text = latest_text(MAIN, path)
+        if text:
+            (sdir / f"d12_{sub}_samples.txt").write_text(text)
+            info(f"collected {path} -> figures/samples/d12_{sub}_samples.txt")
+            got += 1
+
+    # d32 pair (fixed names produced by sample_d32).
+    for src, out_name in [
+        ("samples/original_T0.8_samples.txt", "d32_original_samples.txt"),
+        ("samples/d32ft-amap-step3000_T0.8_samples.txt",
+         "d32_amap_converted_samples.txt"),
+    ]:
+        text = latest_text(D32FT, src)
+        if text:
+            (sdir / out_name).write_text(text)
+            info(f"collected {src} -> figures/samples/{out_name}")
+            got += 1
+        else:
+            warn(f"d32 samples missing: {src} (run sample-d32.yml)")
+    info(f"collected {got}/5 sample files")
+
+
 if __name__ == "__main__":
     info("collecting artifacts and building figures...")
     fig_conversion()
     fig_samples()
     fig_scratch_curves()
     fig_core_fingerprint()
+    collect_samples()
     info("done. (WARN lines above list anything skipped — rerun after "
          "pending launches to fill in.)")
