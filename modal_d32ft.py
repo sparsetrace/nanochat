@@ -18,11 +18,12 @@ ephemeral scripts/_d32ft_base_train.py that adds one --init-from-model argument.
 VINTAGE NOTE (why the warm start is strict-with-allowlist, not strict=True):
 the published checkpoint is Oct-2025 architecture. Its 1.9B params are fully
 accounted for by matrices + wte/lm_head at vocab 65,536 — it has NO
-value_embeds, which this fork's model does have. Missing keys are therefore
-expected, but ONLY on the value_embeds allowlist; anything else aborts.
-Missing value-embedding tables are ZEROED after load so their contribution
-vanishes: the grafted model then differs from the source by the AMAP operator
-alone, which is the ansatz semantics we want to measure.
+value_embeds and none of the modern scalar/gate machinery (x0_lambdas,
+resid_lambdas, smear_*, backout_lambda, ve_gate), which this fork's model has.
+Missing keys are therefore expected, but ONLY on that allowlist; anything else
+aborts. Vintage-absent parameters are set to GRAFT-NEUTRAL values (the source
+model's implicit values: resid scaling 1.0, mixings 0.0, VE tables zeroed) so
+the grafted model differs from the source by the AMAP operator alone.
 
 IMPORTANT harness constraint: this function runs under the container's SYSTEM
 python (modal + huggingface_hub only). torch exists ONLY inside the repo venv;
@@ -234,11 +235,8 @@ def _install_warmstart_train_module() -> str:
     # Strict-with-allowlist warm start (see VINTAGE NOTE in module docstring):
     #  - unexpected keys        -> hard error (checkpoint has things we lack)
     #  - shape mismatches       -> hard error (wrong tokenizer/config)
-    #  - missing keys           -> hard error UNLESS on the value_embed
-    #                              allowlist (known Oct-2025 vintage drift)
-    #  - allowlisted missing    -> loaded model keeps them, then we ZERO them,
-    #                              so the graft differs from the source by the
-    #                              AMAP operator alone (no fresh-init noise).
+    #  - missing keys           -> hard error UNLESS on the vintage allowlist
+    #  - allowlisted missing    -> set to GRAFT-NEUTRAL values (see below)
     warmstart = r"""
 elif args.init_from_model:
     print0(f"[d32ft] Weights-only warm start from {args.init_from_model}")
@@ -274,15 +272,17 @@ elif args.init_from_model:
     assert not _bad_missing, \
         f"[d32ft] missing keys outside the vintage allowlist: {_bad_missing}"
     model.load_state_dict(_init_state, strict=False)
-    # Policy for vintage-absent modules:
-    #  - value_embeds TABLES: zero them (additive content; zero = no
-    #    contribution, deterministic).
-    #  - scalars/gates (resid_lambdas, x0_lambdas, ve_gate, smear_*,
-    #    backout_*): KEEP init_weights() values — these features are
-    #    initialized neutral-by-design (gates closed, residual scales at
-    #    identity); zeroing e.g. resid_lambdas could kill the residual
-    #    stream. We print their post-init values so neutrality is verifiable
-    #    in the log.
+    # Policy for vintage-absent modules — GRAFT-NEUTRAL values, i.e. the
+    # source model's implicit values, NOT init_weights' from-scratch values:
+    #  - value_embeds TABLES: zero (additive content; zero = no contribution).
+    #  - ve_gate / smear_gate: keep init (small, and gated by zeroed
+    #    tables / smear_lambda=0 respectively — inert at step 0).
+    #  - resid_lambdas -> 1.0 exactly. init_weights gives ~1.13-1.15, which
+    #    compounds ~50x over 32 layers on a stream trained at implicit 1.0.
+    #  - x0_lambdas -> 0.0 (source model had no x0 mixing).
+    #  - backout_lambda -> 0.0 (source model had no backout mixing).
+    #  - smear_lambda: init is already 0.0 (verified in log) — kept.
+    # The step-0 val bpb is the ultimate adjudicator of neutrality.
     with torch.no_grad():
         for _k, _p in model.named_parameters():
             if _k not in _missing:
@@ -290,6 +290,14 @@ elif args.init_from_model:
             if "value_embeds" in _k:
                 _p.zero_()
                 print0(f"[d32ft]   zero-initialized VE table: {_k}")
+            elif "resid_lambda" in _k:
+                _p.fill_(1.0)
+                print0(f"[d32ft]   graft-neutral override: {_k} -> 1.0 "
+                       f"(was from-scratch init ~1.13)")
+            elif "x0_lambda" in _k or "backout_lambda" in _k:
+                _p.zero_()
+                print0(f"[d32ft]   graft-neutral override: {_k} -> 0.0 "
+                       f"(was from-scratch init)")
             else:
                 _flat = _p.detach().float().flatten()
                 _preview = ", ".join(f"{v:.3f}" for v in _flat[:8].tolist())
@@ -691,6 +699,14 @@ def train_d32ft(
                 "num_gpus": nproc,
                 "data_shards_requested": data_shards,
                 "extra_args": extra_args,
+                "graft_neutralization": {
+                    "value_embeds": "zeroed",
+                    "resid_lambdas": 1.0,
+                    "x0_lambdas": 0.0,
+                    "backout_lambda": 0.0,
+                    "smear_lambda": "init (0.0)",
+                    "ve_gate/smear_gate": "init (inert via zeroed tables / smear_lambda=0)",
+                },
             },
             indent=2,
         )
