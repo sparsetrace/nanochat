@@ -76,6 +76,10 @@ image = (
             "OMP_NUM_THREADS": "1",
             "HF_HUB_DISABLE_XET": "1",
             "NANOCHAT_BASE_DIR": CACHE_DIR,
+            # Persist compile artifacts on the Volume: first d32-eager compile
+            # costs many minutes; relaunches then reuse it instead of repaying.
+            "TORCHINDUCTOR_CACHE_DIR": f"{CACHE_DIR}/inductor_cache",
+            "TRITON_CACHE_DIR": f"{CACHE_DIR}/triton_cache",
         }
     )
     .add_local_dir(
