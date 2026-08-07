@@ -57,6 +57,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+
+# Module-level eager-mask cache: shared across all attention layers and model
+# instances (masks are layer-independent). Bucketed to 256-multiples in
+# _get_eager_mask, so it holds at most a handful of entries per device.
+_EAGER_MASK_CACHE = {}
 from nanochat.optim import MuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
@@ -148,32 +153,44 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         # Cache for eager-path additive masks, keyed by (T, left_window).
         # Plain dict (not a buffer): device-local, rebuilt lazily, never checkpointed.
-        self._eager_mask_cache = {}
+        # Eager attention masks are shared MODULE-LEVEL (see _EAGER_MASK_CACHE):
+        # masks are identical across layers, and a per-instance cache
+        # multiplies the footprint by n_layer (32x at d32 — the second half
+        # of the CORE-eval memory leak).
 
     def _get_eager_mask(self, T, window_size, device):
         """Additive (-inf) mask. Causal mode reproduces FA3 semantics:
         window_size=(left, 0): i attends to j iff i - left <= j <= i.
         Bidirectional mode: all pairs allowed (two-sided |i-j| <= left if a
-        finite window is set)."""
+        finite window is set).
+
+        Cache is MODULE-LEVEL (shared by all layers: masks are layer-
+        independent) and BUCKETED: masks are built at T rounded up to a
+        multiple of 256 and served as the top-left (T, T) slice — the leading
+        principal submatrix of a causal band mask is exactly the band mask
+        for the smaller length. Without both, variable-length evaluation
+        leaks unboundedly: per-length x per-layer masks reached ~76GB over
+        18 CORE tasks and ~58GB more within squad alone at d32."""
         left = window_size[0]
-        key = (T, left, self.bidirectional)
-        mask = self._eager_mask_cache.get(key)
-        if mask is None or mask.device != device:
-            i = torch.arange(T, device=device).view(T, 1)
-            j = torch.arange(T, device=device).view(1, T)
+        Tb = ((T + 255) // 256) * 256
+        key = (Tb, left, self.bidirectional, str(device))
+        mask = _EAGER_MASK_CACHE.get(key)
+        if mask is None:
+            i = torch.arange(Tb, device=device).view(Tb, 1)
+            j = torch.arange(Tb, device=device).view(1, Tb)
             if self.bidirectional:
-                allowed = torch.ones(T, T, dtype=torch.bool, device=device)
-                if left >= 0 and left < T:
+                allowed = torch.ones(Tb, Tb, dtype=torch.bool, device=device)
+                if left >= 0 and left < Tb:
                     allowed = (j - i).abs() <= left
             else:
                 allowed = (j <= i)
                 if left >= 0:
                     allowed = allowed & (j >= i - left)
-            mask = torch.zeros(T, T, device=device, dtype=torch.float32)
+            mask = torch.zeros(Tb, Tb, device=device, dtype=torch.float32)
             mask.masked_fill_(~allowed, float("-inf"))
             mask = mask.to(COMPUTE_DTYPE)
-            self._eager_mask_cache[key] = mask
-        return mask
+            _EAGER_MASK_CACHE[key] = mask
+        return mask[:T, :T]
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
