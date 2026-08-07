@@ -1,0 +1,67 @@
+# .github/workflows/sample-d32.yml — generation panel for the conversion section:
+# temperature-matched samples from the ORIGINAL Karpathy d32 (standard attention)
+# or the CONVERTED AMAP checkpoint, same prompts, same seeds. Runs attached on
+# an A10G (~cents); text streams into this log and uploads to the d32ft repo.
+name: Sample d32 (original / converted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which model to sample"
+        type: choice
+        options:
+          - converted
+          - original
+        required: false
+        default: "converted"
+      run_tag:
+        description: "Converted run tag (also supplies the architecture template for 'original')"
+        required: false
+        default: "d32ft-amap"
+      step:
+        description: "Converted checkpoint step (-1 = newest on Volume)"
+        required: false
+        default: "-1"
+      prompts:
+        description: "Semicolon-separated prompts (empty = default 7)"
+        required: false
+        default: ""
+      num_samples:
+        description: "Samples per prompt"
+        required: false
+        default: "3"
+      max_tokens:
+        description: "Tokens per sample"
+        required: false
+        default: "100"
+      temperature:
+        description: "Sampling temperature (0 = greedy)"
+        required: false
+        default: "0.8"
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Sample
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run modal_d32ft.py::sample_d32 \
+            --source "${{ inputs.source }}" \
+            --run-tag "${{ inputs.run_tag }}" \
+            --step "${{ inputs.step }}" \
+            --prompts "${{ inputs.prompts }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --max-tokens "${{ inputs.max_tokens }}" \
+            --temperature "${{ inputs.temperature }}"
