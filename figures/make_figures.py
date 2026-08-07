@@ -133,9 +133,10 @@ def save_csv(name: str, rows: dict, header: str):
 
 def savefig(fig, stem: str):
     for ext in ("pdf", "png"):
-        fig.savefig(OUT / f"{stem}.{ext}", dpi=200, bbox_inches="tight")
+        fig.savefig(OUT / f"{stem}.{ext}", dpi=200, bbox_inches="tight",
+                    transparent=True)
     plt.close(fig)
-    info(f"wrote {stem}.pdf/.png")
+    info(f"wrote {stem}.pdf/.png (transparent)")
 
 
 # ── Figure 1: conversion recovery curve ─────────────────────────────────────
@@ -161,24 +162,35 @@ def fig_conversion():
     if train:
         ax2 = ax.twinx()
         ts = list(train)
-        ax2.plot(ts, [train[t] for t in ts], lw=0.5, alpha=0.25,
+        ax2.plot(ts, [train[t] for t in ts], lw=0.5, alpha=0.20,
                  color="gray", zorder=1)
         ax2.set_ylabel("train loss (nats)", color="gray", fontsize=8)
         ax2.tick_params(labelsize=7, colors="gray")
     ss = list(val)
-    ax.plot(ss, [val[s] for s in ss], "o-", ms=3.5, lw=1.4,
+    ax.plot(ss, [val[s] for s in ss], "o-", ms=3.2, lw=1.4,
             color="tab:blue", zorder=3, label="converted (AMAP)")
+    # Log-y: the swap spike and the sub-0.01 tail fluctuations become
+    # simultaneously visible (linear scale crushed the tail flat).
+    ax.set_yscale("log")
+    yticks = [0.7, 0.8, 1.0, 1.2, 1.5, 2.0]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{t:g}" for t in yticks])
+    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ax.annotate("operator swap", xy=(ss[0], val[ss[0]]),
-                xytext=(ss[0] + 250, val[ss[0]] - 0.12),
+                xytext=(ss[0] + 260, val[ss[0]] * 0.82),
                 fontsize=8, arrowprops=dict(arrowstyle="->", lw=0.8))
+    end_s = ss[-1]
+    ax.annotate(f"{val[end_s]:.4f}", xy=(end_s, val[end_s]),
+                xytext=(end_s - 620, val[end_s] * 1.10), fontsize=8,
+                arrowprops=dict(arrowstyle="->", lw=0.8))
     ax.axvline(2250, color="k", lw=0.6, alpha=0.35)
-    ax.text(2250, ax.get_ylim()[1], " LR anneal", fontsize=7,
-            va="top", alpha=0.7)
+    ax.text(2270, 1.35, "LR anneal", fontsize=7, rotation=90,
+            va="center", alpha=0.7)
     if probe_bpb is not None:
         ax.axhline(probe_bpb, ls="--", color="tab:red", lw=1.1,
                    label=f"original model ({probe_bpb:.3f})")
     ax.set_xlabel("reconditioning step")
-    ax.set_ylabel("validation bits per byte")
+    ax.set_ylabel("validation bits per byte (log)")
     ax.legend(fontsize=8, loc="upper right")
     savefig(fig, "fig_conversion")
 
@@ -212,20 +224,26 @@ def fig_samples():
 
 # ── Figure 3: from-scratch three-arm curves ─────────────────────────────────
 def fig_scratch_curves():
-    arms = [("standard", MAIN, "attention/logs/d12-base_train.log",
+    # Candidate log paths per arm: the earliest baseline run may live under a
+    # different tag; we mine every candidate's revision history and treat
+    # distinct versions as distinct runs (replicas).
+    arms = [("standard",
+             ["attention/logs/d12-base_train.log",
+              "attention/logs/nanochat-d12_train.log",
+              "attention/logs/d12_train.log"],
              "tab:gray"),
-            ("AMAP", MAIN, "AMAP/logs/d12-a00_train.log", "tab:blue"),
-            ("DMAP", MAIN, "DMAP/logs/d12-a10_train.log", "tab:red")]
+            ("AMAP", ["AMAP/logs/d12-a00_train.log"], "tab:blue"),
+            ("DMAP", ["DMAP/logs/d12-a10_train.log"], "tab:red")]
     fig, ax = plt.subplots(figsize=(5.2, 3.4))
     plotted = 0
-    for name, repo, log_path, color in arms:
-        versions = file_versions(repo, log_path)
+    curves = {}
+    for name, paths, color in arms:
+        versions = []
+        for p in paths:
+            versions.extend(file_versions(MAIN, p))
         if not versions:
-            warn(f"no versions for {name} ({log_path})")
+            warn(f"no versions for {name} (tried: {paths})")
             continue
-        # Distinct historical versions of the same log = distinct runs.
-        # Plot up to two for the baseline (noise-floor visual), newest one
-        # for the variants.
         n_plot = 2 if name == "standard" else 1
         for k, text in enumerate(versions[:n_plot]):
             points = {int(m.group(1)): float(m.group(2))
@@ -238,6 +256,8 @@ def fig_scratch_curves():
                     alpha=1.0 if k == 0 else 0.55, label=label)
             save_csv(f"d12_{name}{'' if k == 0 else '_replica'}_val_bpb.csv",
                      dict(sorted(points.items())), "val_bpb")
+            if k == 0:
+                curves[name] = points
             plotted += 1
     if plotted == 0:
         warn("no from-scratch curves found — skipping fig_scratch_curves")
@@ -245,8 +265,23 @@ def fig_scratch_curves():
         return
     ax.set_xlabel("training step")
     ax.set_ylabel("validation bits per byte")
-    ax.set_ylim(0.82, 1.05)
-    ax.legend(fontsize=8)
+    # Full range so DMAP's early trajectory is visible; cap only the very
+    # first near-random points.
+    all_vals = [v for pts in curves.values() for v in pts.values()]
+    ax.set_ylim(min(all_vals) - 0.005, min(1.6, max(all_vals) + 0.02))
+    ax.legend(fontsize=8, loc="upper right")
+    # Inset: final 600 steps, tight y — makes the +0.0021 AMAP gap and the
+    # replica coincidence visible where the full panel cannot resolve them.
+    if curves:
+        axin = ax.inset_axes([0.42, 0.38, 0.54, 0.42])
+        for name, _, color in arms:
+            if name not in curves:
+                continue
+            pts = curves[name]
+            ss = [s for s in sorted(pts) if s >= 1900]
+            axin.plot(ss, [pts[s] for s in ss], "-", lw=1.2, color=color)
+        axin.tick_params(labelsize=6)
+        axin.set_title("final 600 steps", fontsize=7)
     savefig(fig, "fig_scratch_curves")
 
 
@@ -276,8 +311,9 @@ def fig_core_fingerprint():
                        fontsize=7)
     ax.set_xlabel("centered accuracy: converted $-$ original")
     ax.set_title(
-        f"CORE: original {orig['core_metric']:.3f} -> "
-        f"converted {conv['core_metric']:.3f} (GPT-2: 0.257)", fontsize=9)
+        f"CORE: original {orig['core_metric']:.3f} $\\rightarrow$ "
+        f"converted {conv['core_metric']:.3f}  (GPT-2: 0.257)",
+        fontsize=9, fontweight="bold")
     savefig(fig, "fig_core_fingerprint")
 
 
