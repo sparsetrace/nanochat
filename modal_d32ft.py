@@ -580,7 +580,18 @@ def upload_artifacts(
     return {"ok": True, "run": run_tag, "uploaded": len(ops)}
 
 
-
+@app.function(
+    image=image,
+    gpu=GPU_CONFIG,
+    cpu=32,
+    memory=131072,
+    timeout=24 * 60 * 60,
+    retries=0,
+    scaledown_window=5,
+    volumes={CACHE_DIR: ckpt_vol},
+    secrets=[hf_secret],
+)
+def train_d32ft(
     hf_repo: str = HF_REPO_DEFAULT,
     run_tag: str = "d32ft-amap",
     num_gpus: int = 1,
