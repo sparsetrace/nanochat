@@ -76,6 +76,10 @@ image = (
             "OMP_NUM_THREADS": "1",
             "HF_HUB_DISABLE_XET": "1",
             "NANOCHAT_BASE_DIR": CACHE_DIR,
+            # Reduce fragmentation-induced OOM at borderline peak memory
+            # (d32-eager sits at ~77-79GB of 80GB; allocation-order changes
+            # across resume/compile-cache paths otherwise tip it over).
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             # Persist compile artifacts on the Volume: first d32-eager compile
             # costs many minutes; relaunches then reuse it instead of repaying.
             "TORCHINDUCTOR_CACHE_DIR": f"{CACHE_DIR}/inductor_cache",
@@ -374,6 +378,16 @@ def _checkpoint_steps(files: list[str], prefix: str) -> list[int]:
 def _restore_own_checkpoint(api, hf_repo: str, token: str, run_name: str):
     from huggingface_hub import hf_hub_download
 
+    ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_name
+
+    # ── Volume first: the previous run SAVED here; reading it back costs
+    #    seconds. HF is the durable mirror, not the hot path — paying
+    #    8xH100 rates to re-download ~30GB we already have is silly. ──────────
+    local_names = ([p.name for p in ckpt_dir.iterdir() if p.is_file()]
+                   if ckpt_dir.exists() else [])
+    local_steps = _checkpoint_steps(local_names, "")
+    best_local = local_steps[-1] if local_steps else -1
+
     files = list(api.list_repo_files(repo_id=hf_repo))
     candidates = [
         ("latest/", _checkpoint_steps(files, "latest/")),
@@ -382,51 +396,59 @@ def _restore_own_checkpoint(api, hf_repo: str, token: str, run_name: str):
             _checkpoint_steps(files, f"checkpoints/{run_name}/"),
         ),
     ]
-
-    chosen_prefix = None
-    chosen_step = None
+    chosen_prefix, chosen_step = None, -1
     for prefix, steps in candidates:
-        if steps:
-            chosen_prefix = prefix
-            chosen_step = max(steps)
-            break
-    if chosen_prefix is None:
+        if steps and steps[-1] > chosen_step:
+            chosen_prefix, chosen_step = prefix, steps[-1]
+
+    if best_local < 0 and chosen_prefix is None:
         return None
 
-    ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_name
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    step_token = f"{chosen_step:06d}"
+    if best_local >= chosen_step:
+        # Volume has the newest (or only) checkpoint — no download at all.
+        use_step = best_local
+        print(
+            f"[d32ft] RESUME (volume, no download): step {use_step} "
+            f"already in {ckpt_dir}"
+        )
+    else:
+        # HF is newer (e.g. fresh volume, or another workspace trained since).
+        use_step = chosen_step
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        step_token = f"{use_step:06d}"
+        print(
+            f"[d32ft] RESUME (HF download): {hf_repo}/{chosen_prefix} "
+            f"step {use_step} (volume has {best_local})"
+        )
+        for repo_file in files:
+            name = Path(repo_file).name
+            if repo_file.startswith(chosen_prefix) and step_token in name and (
+                name.startswith("model_") or name.startswith("meta_")
+                or name.startswith("optim_")
+            ):
+                cached = hf_hub_download(
+                    repo_id=hf_repo,
+                    filename=repo_file,
+                    token=token,
+                    # /tmp = fast local disk; staging through the Volume
+                    # doubled every byte over the network FS.
+                    local_dir="/tmp/hf_resume",
+                )
+                shutil.copy2(cached, ckpt_dir / name)
 
-    for repo_file in files:
-        name = Path(repo_file).name
-        if repo_file.startswith(chosen_prefix) and step_token in name and (
-            name.startswith("model_") or name.startswith("meta_")
-            or name.startswith("optim_")
-        ):
-            cached = hf_hub_download(
-                repo_id=hf_repo,
-                filename=repo_file,
-                token=token,
-                local_dir=str(Path(CACHE_DIR) / "hf_resume"),
-            )
-            shutil.copy2(cached, ckpt_dir / name)
-
-    meta = json.loads((ckpt_dir / f"meta_{chosen_step:06d}.json").read_text())
+    meta = json.loads((ckpt_dir / f"meta_{use_step:06d}.json").read_text())
     uc = meta.get("user_config", {}) or {}
     if int(uc.get("depth", -1)) != 32:
         raise RuntimeError(
-            f"Refusing non-d32 checkpoint from {hf_repo}: depth={uc.get('depth')}"
+            f"Refusing non-d32 checkpoint: depth={uc.get('depth')}"
         )
     if uc.get("model_tag") not in (None, run_name):
         raise RuntimeError(
             f"Refusing model_tag={uc.get('model_tag')!r}; expected {run_name!r}"
         )
 
-    print(
-        f"[d32ft] RESUME: {hf_repo}/{chosen_prefix} step {chosen_step} "
-        f"-> {ckpt_dir}"
-    )
-    return chosen_step, ckpt_dir
+    print(f"[d32ft] RESUME: step {use_step} -> {ckpt_dir}")
+    return use_step, ckpt_dir
 
 
 def _periodic_sync(
@@ -484,16 +506,81 @@ def _periodic_sync(
 
 @app.function(
     image=image,
-    gpu=GPU_CONFIG,
-    cpu=32,
-    memory=131072,
-    timeout=24 * 60 * 60,
-    retries=0,
+    cpu=8,
+    memory=32768,
+    timeout=4 * 60 * 60,
     scaledown_window=5,
     volumes={CACHE_DIR: ckpt_vol},
     secrets=[hf_secret],
 )
-def train_d32ft(
+def upload_artifacts(
+    hf_repo: str,
+    run_tag: str,
+    horizon: int,
+    keep_last_steps: int = 1,
+) -> dict:
+    """Detached CPU stage-out: pushes checkpoint + logs to HF and prunes
+    superseded checkpoint steps from the Volume. Spawned by train_d32ft at
+    the end of a run so the 8xH100 container never idles through a ~30GB
+    upload (CPU worker: cents; idle GPUs: ~$5-10 per upload)."""
+    from huggingface_hub import HfApi, CommitOperationAdd
+
+    token = os.environ.get("HF_TOKEN", "")
+    api = HfApi(token=token)
+    ckpt_vol.reload()  # see the training container's committed writes
+
+    ckpt_dir = Path(CACHE_DIR) / "base_checkpoints" / run_tag
+    logs_dir = Path(CACHE_DIR) / "logs"
+
+    ops = []
+    if ckpt_dir.exists():
+        for p in sorted(ckpt_dir.iterdir()):
+            if not p.is_file():
+                continue
+            ops.append(CommitOperationAdd(
+                path_in_repo=f"latest/{p.name}", path_or_fileobj=str(p)))
+            ops.append(CommitOperationAdd(
+                path_in_repo=f"checkpoints/{run_tag}/{p.name}",
+                path_or_fileobj=str(p)))
+    for name, dest in [
+        (f"{run_tag}_metrics.csv", f"logs/{run_tag}_metrics.csv"),
+        (f"{run_tag}_icl.csv", f"logs/{run_tag}_icl.csv"),
+        (f"{run_tag}_train.log", f"logs/{run_tag}_train.log"),
+        (f"{run_tag}_samples.txt", f"samples/{run_tag}_samples.txt"),
+        (f"{run_tag}_provenance.json", f"logs/{run_tag}_provenance.json"),
+    ]:
+        p = logs_dir / name
+        if p.exists():
+            ops.append(CommitOperationAdd(path_in_repo=dest, path_or_fileobj=str(p)))
+    if ops:
+        api.create_commit(
+            repo_id=hf_repo,
+            operations=ops,
+            commit_message=f"{run_tag}: AMAP d32ft through step {horizon}",
+        )
+        print(f"[d32ft-upload] pushed {len(ops)} file(s) in one commit")
+
+    # Prune superseded checkpoint steps from the Volume (keep newest N).
+    # NOTE: prunes ONLY base_checkpoints/<run_tag>/ step files — the
+    # tokenizer, dataset shards, Karpathy seed, and compile caches stay:
+    # they are the warm state that makes relaunches fast.
+    if ckpt_dir.exists():
+        step_re = re.compile(r"(?:model|meta|optim)_(\d+)")
+        steps = sorted({int(m.group(1)) for p in ckpt_dir.iterdir()
+                        if (m := step_re.match(p.name))})
+        for old in steps[:-keep_last_steps] if keep_last_steps > 0 else []:
+            tok = f"{old:06d}"
+            for p in list(ckpt_dir.iterdir()):
+                if tok in p.name:
+                    p.unlink()
+            print(f"[d32ft-upload] pruned superseded step {old} from Volume")
+        ckpt_vol.commit()
+
+    print("[d32ft-upload] all done, returning.")
+    return {"ok": True, "run": run_tag, "uploaded": len(ops)}
+
+
+
     hf_repo: str = HF_REPO_DEFAULT,
     run_tag: str = "d32ft-amap",
     num_gpus: int = 1,
