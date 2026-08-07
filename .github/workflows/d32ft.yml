@@ -25,9 +25,9 @@ on:
         default: "8"
 
       add_steps:
-        description: "NEW optimization steps this launch"
+        description: "NEW optimization steps this launch (auto-resume continues from the newest checkpoint in latest/)"
         required: false
-        default: "1000"
+        default: "1500"
 
       save_every:
         description: "Checkpoint every N steps (~1-2h apart at 8xH100 d32-eager)"
@@ -115,6 +115,7 @@ jobs:
             --warmdown-ratio=0.0
             --final-lr-frac=1.0
             --core-metric-every=-1
+            --eval-every=100
             --sample-every=250
 
         run: |
