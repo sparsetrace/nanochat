@@ -1,0 +1,52 @@
+# .github/workflows/core-d32.yml — CORE capability metric for the conversion
+# section: original Karpathy d32 (standard attention, FA3, ~15-30 min) or the
+# converted AMAP checkpoint (chunked eager eval, budget ~1-2h). Attached run;
+# per-task scores stream into this log, JSON uploads to the d32ft repo.
+name: CORE eval d32 (original / converted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which model to evaluate"
+        type: choice
+        options:
+          - original
+          - converted
+        required: false
+        default: "original"
+      run_tag:
+        description: "Converted run tag (also supplies the architecture template for 'original')"
+        required: false
+        default: "d32ft-amap"
+      step:
+        description: "Converted checkpoint step (-1 = newest on Volume)"
+        required: false
+        default: "-1"
+      max_per_task:
+        description: "CORE examples per task (500 = standard)"
+        required: false
+        default: "500"
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Evaluate CORE
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run modal_d32ft.py::core_eval_d32 \
+            --source "${{ inputs.source }}" \
+            --run-tag "${{ inputs.run_tag }}" \
+            --step "${{ inputs.step }}" \
+            --max-per-task "${{ inputs.max_per_task }}"
