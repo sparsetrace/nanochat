@@ -1,0 +1,121 @@
+# .github/workflows/d32-probe.yml
+# Measure Karpathy's ORIGINAL d32 (standard attention, weights verbatim) on our
+# exact val set + eval code: the step-0 eval block of a 1-step "graft" IS the
+# original model's scorecard — bpb anchor, ICL score, induction accuracy.
+# Costs ~$3 on 1xH100 (standard attention uses FA3; no eager tax).
+#
+# Separate HF repo (default sparsetrace/d32ft-std): the d32ft repo's latest/
+# is flat, and a standard-attention probe must not clobber the AMAP mirror.
+name: Probe original d32 (standard attention)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: "HF repo for probe artifacts (NOT sparsetrace/d32ft — its latest/ holds the AMAP run)"
+        required: false
+        default: "sparsetrace/d32ft-std"
+
+      run_tag:
+        description: "Run/checkpoint identity"
+        required: false
+        default: "d32-std-probe"
+
+      num_gpus:
+        description: "H100 count (1 is fine: eval + one step)"
+        required: false
+        default: "1"
+
+      add_steps:
+        description: "Steps after the step-0 eval (1 = minimal; the eval is the product)"
+        required: false
+        default: "1"
+
+      extra_args:
+        description: "Operator override + batch (last-wins over VARIANT_ARGS)"
+        required: false
+        default: "--attn-variant=standard --device-batch-size=2"
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy d32ft app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy modal_d32ft.py
+
+      - name: Spawn original-d32 probe
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: ${{ inputs.hf_repo }}
+          RUN_TAG: ${{ inputs.run_tag }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          RESUME: never
+          ADD_STEPS: ${{ inputs.add_steps }}
+          SAVE_EVERY: "100000"
+          DATA_SHARDS: "60"
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+
+          # Same recipe as the AMAP runs so the comparison is exact; the
+          # --attn-variant=standard in EXTRA_ARGS overrides hmap (last-wins).
+          VARIANT_ARGS: >-
+            --attn-variant=hmap
+            --hmap-alpha=0.0
+            --device-batch-size=4
+            --total-batch-size=524288
+            --embedding-lr=0.03
+            --unembedding-lr=0.0008
+            --matrix-lr=0.002
+            --scalar-lr=0.05
+            --weight-decay=0.0
+            --warmup-steps=40
+            --warmdown-ratio=0.0
+            --final-lr-frac=1.0
+            --core-metric-every=-1
+            --eval-every=100
+            --sample-every=250
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-d32ft", "train_d32ft")
+
+          num_gpus = int(os.environ["NUM_GPUS"])
+          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
+          extra = (
+              os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
+          ).strip()
+
+          f = f.with_options(gpu=gpu_request)
+
+          call = f.spawn(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              num_gpus=num_gpus,
+              resume=os.environ["RESUME"],
+              add_steps=int(os.environ["ADD_STEPS"]),
+              save_every=int(os.environ["SAVE_EVERY"]),
+              data_shards=int(os.environ["DATA_SHARDS"]),
+              extra_args=extra,
+          )
+
+          print("launched, call id:", call.object_id)
+          PY
