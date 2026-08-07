@@ -1,0 +1,43 @@
+# .github/workflows/figures.yml — build all paper figures from the HF artifact
+# repos (with revision-history merging of overwritten logs) and commit them to
+# the figures/ folder of this repo. Runs entirely on the GitHub runner — no
+# Modal, no GPU, ~2-5 minutes. Rerun any time; skipped figures (pending
+# launches) fill in on later runs. Requires HF_TOKEN (private repos).
+name: Build paper figures
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allows the workflow to commit figures back to the repo
+
+jobs:
+  figures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install matplotlib huggingface_hub
+
+      - name: Build figures
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python figures/make_figures.py
+
+      - name: Commit figures to repo
+        run: |
+          git config user.name "figures-bot"
+          git config user.email "figures-bot@users.noreply.github.com"
+          git add figures/
+          if git diff --cached --quiet; then
+            echo "No figure changes to commit."
+          else
+            git commit -m "Rebuild paper figures from HF artifacts"
+            git push
+          fi
