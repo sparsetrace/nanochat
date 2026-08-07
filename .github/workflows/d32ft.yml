@@ -1,48 +1,54 @@
-# .github/workflows/d32ft.yml
-name: Recondition nanochat d32 (AMAP)
+# .github/workflows/d32ft-finish.yml
+# Finishing chunk for the d32 AMAP reconditioning: +1400 steps to horizon 3000,
+# WITH an LR anneal over the final 25% (overriding the reconditioning default
+# of no-warmdown). This converts the constant-LR oscillation into loss and
+# freezes the induction circuit at its basin value — the declared endpoint.
+#
+# Uses the UNCHANGED modal_d32ft.py deployment (same spawn signature); the
+# anneal arrives purely via extra_args (argparse last-wins over VARIANT_ARGS).
+name: Finish d32 AMAP (anneal to 3000)
 
 on:
   workflow_dispatch:
     inputs:
       run_tag:
-        description: "Run/checkpoint identity"
+        description: "Run/checkpoint identity (must match the reconditioning run)"
         required: false
         default: "d32ft-amap"
 
       resume:
-        description: "auto=own ckpt else Karpathy; never=re-bootstrap; force=require own ckpt"
+        description: "auto (expects the step-1600 checkpoint); force=require own ckpt"
         type: choice
         options:
           - auto
-          - never
           - force
         required: false
         default: "auto"
 
       num_gpus:
-        description: "H100 count (8 = one optimizer step per 8 accum micro-steps at batch 4; 1-GPU d32 is a multi-day slog)"
+        description: "H100 count"
         required: false
         default: "8"
 
       add_steps:
-        description: "NEW optimization steps this launch (auto-resume continues from the newest checkpoint in latest/)"
+        description: "NEW steps this launch (1400 -> horizon 3000)"
         required: false
-        default: "1500"
+        default: "1400"
 
       save_every:
-        description: "Checkpoint every N steps (~1-2h apart at 8xH100 d32-eager)"
+        description: "Checkpoint every N steps"
         required: false
         default: "100"
 
       data_shards:
-        description: "nanochat base-data shards to ensure downloaded (1000 steps x 0.5M tokens needs ~15; 60 gives headroom)"
+        description: "nanochat base-data shards to ensure downloaded"
         required: false
         default: "60"
 
       extra_args:
-        description: "Override/append base_train flags (argparse last-wins over VARIANT_ARGS)"
+        description: "Anneal overrides (last-wins over VARIANT_ARGS). Default warms the LR down over the final 750 steps to 0.1x"
         required: false
-        default: ""
+        default: "--warmdown-ratio=0.25 --final-lr-frac=0.1"
 
 jobs:
   launch:
@@ -66,7 +72,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: modal deploy modal_d32ft.py
 
-      - name: Spawn d32 AMAP reconditioning
+      - name: Spawn d32 AMAP finishing anneal
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -80,27 +86,9 @@ jobs:
           DATA_SHARDS: ${{ inputs.data_shards }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
 
-          # modal_d32ft.py hardcodes:
-          #   depth=32
-          #   window_pattern=L
-          #
-          # HMAP alpha=0 is AMAP; the warm start loads Karpathy's weights with
-          # vintage-aware allowlisting and graft-neutral scalar overrides.
-          #
-          # --device-batch-size=4: an 80GB H100 is massively underutilized at
-          # batch 1 (d12-AMAP at batch 8 peaked at 15.4GB); batch 4 cuts grad
-          # accumulation 4x. If it OOMs (visible in the first minutes), rerun
-          # with extra_args: --device-batch-size=2
-          #
-          # At 8xH100 + batch 4: 524288/(8*4*2048) = 16 accum micro-steps per
-          # optimizer step. At 1 GPU + batch 1 it would be 256 — a multi-day,
-          # many-resume slog for the same dollars.
-          #
-          # These LRs are deliberately 0.1x-ish scratch-pretraining values.
-          # Weight decay is disabled during reconditioning. Warmdown is disabled
-          # so relaunching an additive Modal chunk does not move the LR endpoint.
-          #
-          # 524288 tokens/step matches Karpathy's historical d32 effective batch.
+          # Same reconditioning recipe as d32ft.yml; the anneal flags in
+          # EXTRA_ARGS override --warmdown-ratio=0.0 / --final-lr-frac=1.0
+          # below (argparse last-wins).
           VARIANT_ARGS: >-
             --attn-variant=hmap
             --hmap-alpha=0.0
