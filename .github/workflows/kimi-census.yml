@@ -1,0 +1,71 @@
+name: Kimi-K3 definiteness census
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight first; then kda, mla, or both"
+        type: choice
+        options:
+          - preflight
+          - kda
+          - mla
+          - both
+        required: true
+        default: preflight
+      layers:
+        description: "Layer selection, e.g. 0-92, 0-8, or 0,4,8,12"
+        required: false
+        default: "0-92"
+      revision:
+        description: "HF revision/commit (main by default; pin a commit for publication runs)"
+        required: false
+        default: "main"
+      tol_rel:
+        description: "Relative eigenvalue floor (K3 attention weights are bf16; 5e-3 recommended)"
+        required: false
+        default: "0.005"
+
+permissions:
+  contents: write
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install 'modal<1.5'
+
+      - name: Run Kimi-K3 census on ephemeral Modal CPU
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run modal_kimi_census.py \
+            --mode "${{ inputs.mode }}" \
+            --layers "${{ inputs.layers }}" \
+            --revision "${{ inputs.revision }}" \
+            --tol-rel "${{ inputs.tol_rel }}"
+
+      - name: Commit census outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add samples/kimi-k3_*.json samples/kimi-k3_*.jsonl samples/kimi-k3_*.png 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No changed Kimi census outputs"
+            exit 0
+          fi
+          git commit -m "census: Kimi-K3 ${{ inputs.mode }} [skip ci]"
+          git push
