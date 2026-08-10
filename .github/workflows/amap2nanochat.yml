@@ -117,7 +117,7 @@ jobs:
           VARIANT_ARGS: >-
             --attn-variant=standard
             --window-pattern=L
-            --device-batch-size=8
+            --device-batch-size=4
             --total-batch-size=524288
             --embedding-lr=0.03
             --unembedding-lr=0.0008
