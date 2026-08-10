@@ -1,0 +1,164 @@
+# .github/workflows/amap2nanochat.yml
+# Reverse graft: warm-start a depth-32 nanochat with the AMAP-reconditioned
+# weights from sparsetrace/d32ft, then continue pretraining under Karpathy's
+# ORIGINAL standard attention (FA3 path). Mirror image of d32ft.yml:
+#
+#   d32ft.yml          karpathy d32 (standard)  ->  AMAP operator
+#   amap2nanochat.yml  sparsetrace/d32ft (AMAP) ->  standard operator
+#
+# Deploys the amap2nanochat.py Modal app and spawns train_amap2nanochat.
+# First launch bootstraps from the AMAP checkpoint (Volume-first, HF
+# fallback); relaunches resume this run's own model+optimizer+loop state.
+name: AMAP -> nanochat (standard-attn regraft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run/checkpoint identity for THIS experiment"
+        required: false
+        default: "amap2nanochat"
+
+      resume:
+        description: "auto=resume own ckpt if any, else bootstrap from AMAP seed; never=always bootstrap; force=require own ckpt"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
+        required: false
+        default: "auto"
+
+      seed_run_tag:
+        description: "AMAP run whose checkpoint seeds this graft"
+        required: false
+        default: "d32ft-amap"
+
+      seed_step:
+        description: "AMAP checkpoint step to seed from (-1 = newest)"
+        required: false
+        default: "-1"
+
+      num_gpus:
+        description: "H100 count"
+        required: false
+        default: "8"
+
+      add_steps:
+        description: "NEW steps this launch (additive to any resumed step)"
+        required: false
+        default: "1000"
+
+      save_every:
+        description: "Checkpoint every N steps"
+        required: false
+        default: "250"
+
+      data_shards:
+        description: "nanochat base-data shards to ensure downloaded"
+        required: false
+        default: "240"
+
+      extra_args:
+        description: "Extra base_train args (last-wins over VARIANT_ARGS below)"
+        required: false
+        default: ""
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy amap2nanochat app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy amap2nanochat.py
+
+      - name: Spawn AMAP -> standard-attention regraft
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: sparsetrace/amap2nanochat
+          SEED_REPO: sparsetrace/d32ft
+          RUN_TAG: ${{ inputs.run_tag }}
+          SEED_RUN_TAG: ${{ inputs.seed_run_tag }}
+          SEED_STEP: ${{ inputs.seed_step }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
+          SAVE_EVERY: ${{ inputs.save_every }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+
+          # Regraft recipe (reconditioning-style, mirroring d32ft):
+          # - attn-variant=standard: back to Karpathy's operator (FA3 fast path)
+          # - window-pattern=L: the seed's attention statistics were shaped
+          #   under full-context L, and the original d32 predates sliding
+          #   windows; introduce S windows later via extra_args if desired.
+          # - device-batch-size=16: no eager T^2 logits under FA3, so we can
+          #   run well above the AMAP run's 4; raise/lower via extra_args.
+          # - same low reconditioning LRs and short warmup as d32ft; no
+          #   warmdown by default — anneal in a finishing launch via
+          #   extra_args (e.g. --warmdown-ratio=0.25 --final-lr-frac=0.1),
+          #   argparse last-wins.
+          VARIANT_ARGS: >-
+            --attn-variant=standard
+            --window-pattern=L
+            --device-batch-size=16
+            --total-batch-size=524288
+            --embedding-lr=0.03
+            --unembedding-lr=0.0008
+            --matrix-lr=0.002
+            --scalar-lr=0.05
+            --weight-decay=0.0
+            --warmup-steps=40
+            --warmdown-ratio=0.0
+            --final-lr-frac=1.0
+            --core-metric-every=-1
+            --eval-every=100
+            --sample-every=250
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-amap2nanochat", "train_amap2nanochat")
+
+          num_gpus = int(os.environ["NUM_GPUS"])
+          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
+          extra = (
+              os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
+          ).strip()
+
+          f = f.with_options(gpu=gpu_request)
+
+          call = f.spawn(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              num_gpus=num_gpus,
+              resume=os.environ["RESUME"],
+              seed_repo=os.environ["SEED_REPO"],
+              seed_run_tag=os.environ["SEED_RUN_TAG"],
+              seed_step=int(os.environ["SEED_STEP"]),
+              add_steps=int(os.environ["ADD_STEPS"]),
+              save_every=int(os.environ["SAVE_EVERY"]),
+              data_shards=int(os.environ["DATA_SHARDS"]),
+              extra_args=extra,
+          )
+
+          print("launched, call id:", call.object_id)
+          PY
