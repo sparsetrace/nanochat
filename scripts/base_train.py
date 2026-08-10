@@ -11,7 +11,8 @@ If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Ex
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 
 Additions in this fork:
-- --attn-variant / --hmap-alpha / --witten : HMAP attention family (see nanochat/gpt.py)
+- --attn-variant / --hmap-alpha / --hmap-beta / --witten : HMAP attention family (see nanochat/gpt.py)
+  (beta, alpha): (0,0)=AMAP, (0,1)=DMAP, (1,0)=standard (eager), (1,1)=CMAP
 - --objective mlm : BERT-style masked language modeling (bidirectional attention,
   masked-token cross-entropy). AR-specific evals (val bpb, CORE, Engine sampling)
   are auto-disabled in MLM mode; the training signal is the masked-token loss.
@@ -64,6 +65,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Attention variant (HMAP family; see nanochat/gpt.py)
 parser.add_argument("--attn-variant", type=str, default="standard", choices=["standard", "hmap"], help="attention mechanism; 'hmap' with --hmap-alpha 0 is AMAP, 1 is the DMAP face")
 parser.add_argument("--hmap-alpha", type=float, default=0.0, help="HMAP homotopy coordinate in [0,1]: 0=AMAP (kinetic+flux), 1=DMAP (kinetic+Doob)")
+parser.add_argument("--hmap-beta", type=float, default=0.0, help="kinetic signature coordinate in [0,1]: 0=PSD kinetic (1/2 W_M W_M^T), 1=full indefinite W_S; (beta,alpha)=(1,0) reproduces standard attention eagerly, (1,1)=CMAP")
 parser.add_argument("--witten", action="store_true", help="add independent Witten potential diag(R W_W R^T) to the exact sector (adds params)")
 # Objective
 parser.add_argument("--objective", type=str, default="ar", choices=["ar", "mlm"], help="ar = autoregressive next-token (default), mlm = BERT-style masked LM (bidirectional)")
@@ -177,6 +179,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         attn_variant=args.attn_variant,
         hmap_alpha=args.hmap_alpha,
+        hmap_beta=args.hmap_beta,
         witten=args.witten,
         bidirectional=is_mlm,
     )
