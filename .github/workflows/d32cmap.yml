@@ -1,21 +1,29 @@
-# .github/workflows/regraft2cmap.yml
-# CMAP graft: warm-start a depth-32 nanochat with the regrafted standard-
-# attention weights from sparsetrace/amap2nanochat, then continue pretraining
-# under CMAP — the indefinite-kinetic + Doob corner of the operator square:
+# .github/workflows/d32cmap.yml
+# CMAP graft from the ORIGINAL Karpathy d32: warm-start from
+# karpathy/nanochat-d32:model_000650.pt (vintage strict-with-allowlist +
+# graft-neutral handling) and continue pretraining under CMAP —
+# indefinite kinetic + Doob, the (beta,alpha)=(1,1) corner:
 #
-#   (beta, alpha):  (0,0)=AMAP  (0,1)=DMAP  (1,0)=standard  (1,1)=CMAP
+#   s = 1/2<m,m> - 1/2<n,n> + 1/2(g_i - g_j)
+#     = 1/2(<q_i,k_j> + <k_i,q_j>) + 1/2(g_i - g_j)
 #
-# Lineage: karpathy d32 -> d32ft (AMAP) -> amap2nanochat (standard) -> CMAP.
+# This is the apples-to-apples sibling of the d32ft AMAP run: SAME vintage
+# seed, SAME graft-neutral bootstrap, SAME reconditioning recipe — only the
+# operator corner differs. Compare their ICL/induction CSVs directly.
 #
-# PREREQUISITES on the fork (the harness hard-fails without them):
+# REUSES the modal_d32ft.py harness unchanged: it already implements the
+# vintage bootstrap, and the operator arrives purely via VARIANT_ARGS.
+# run_tag and HF_REPO are distinct so checkpoints/latest/ never mix with
+# the AMAP run's. (Cosmetic note: that harness's provenance JSON hardcodes
+# the string "HMAP alpha=0.0 (AMAP)" — the actual recorded extra_args below
+# are the ground truth for what trained.)
+#
+# PREREQUISITES on the fork (checked implicitly: --hmap-beta is an
+# unrecognized argument and argparse aborts loudly if the plumbing is
+# missing):
 #   - nanochat/gpt.py patched via apply_cmap_patch.py (adds hmap_beta)
-#   - scripts/base_train.py exposes --hmap-beta wired into GPTConfig,
-#     mirroring the existing --hmap-alpha plumbing
-#
-# Deploys regraft2cmap.py and spawns train_regraft2cmap. First launch
-# bootstraps from the regrafted checkpoint (Volume-first, HF fallback);
-# relaunches resume this run's own model+optimizer+loop state.
-name: Regraft -> CMAP (indefinite kinetic + Doob)
+#   - scripts/base_train.py exposes --hmap-beta wired into GPTConfig
+name: d32 -> CMAP (from Karpathy seed)
 
 on:
   workflow_dispatch:
@@ -23,10 +31,10 @@ on:
       run_tag:
         description: "Run/checkpoint identity for THIS experiment"
         required: false
-        default: "regraft2cmap"
+        default: "d32cmap"
 
       resume:
-        description: "auto=resume own ckpt if any, else bootstrap from regrafted seed; never=always bootstrap; force=require own ckpt"
+        description: "auto=resume own ckpt if any, else bootstrap from Karpathy seed; never=always bootstrap; force=require own ckpt"
         type: choice
         options:
           - auto
@@ -35,25 +43,15 @@ on:
         required: false
         default: "auto"
 
-      seed_run_tag:
-        description: "Regrafted run whose checkpoint seeds this graft"
-        required: false
-        default: "amap2nanochat"
-
-      seed_step:
-        description: "Regrafted checkpoint step to seed from (-1 = newest)"
-        required: false
-        default: "-1"
-
       num_gpus:
         description: "H100 count"
         required: false
         default: "8"
 
       add_steps:
-        description: "NEW steps this launch (additive to any resumed step)"
+        description: "NEW steps this launch (AMAP arm ran 1600 + 1400 anneal = 3000 total)"
         required: false
-        default: "1000"
+        default: "1600"
 
       save_every:
         description: "Checkpoint every N steps"
@@ -85,23 +83,22 @@ jobs:
       - name: Install Modal
         run: pip install modal
 
-      - name: Deploy regraft2cmap app
+      - name: Deploy d32ft app (snapshots the CMAP-patched fork)
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: modal deploy regraft2cmap.py
+        run: modal deploy modal_d32ft.py
 
-      - name: Spawn regraft -> CMAP training
+      - name: Spawn d32 -> CMAP training
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
 
-          HF_REPO: sparsetrace/regraft2cmap
-          SEED_REPO: sparsetrace/amap2nanochat
+          # Separate repo: keeps latest/ and checkpoints/ disjoint from the
+          # AMAP run's artifacts in sparsetrace/d32ft.
+          HF_REPO: sparsetrace/d32cmap
           RUN_TAG: ${{ inputs.run_tag }}
-          SEED_RUN_TAG: ${{ inputs.seed_run_tag }}
-          SEED_STEP: ${{ inputs.seed_step }}
           NUM_GPUS: ${{ inputs.num_gpus }}
           RESUME: ${{ inputs.resume }}
           ADD_STEPS: ${{ inputs.add_steps }}
@@ -109,21 +106,13 @@ jobs:
           DATA_SHARDS: ${{ inputs.data_shards }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
 
-          # CMAP recipe (reconditioning-style, mirroring d32ft/a2n):
-          # - hmap alpha=1 beta=1: indefinite kinetic + Doob (CMAP corner).
-          # - window-pattern=L: full causal context, matching the lineage.
-          # - device-batch-size=4: eager T^2 logits are back — this is the
-          #   empirically validated d32-eager footprint from the AMAP runs.
-          #   Do NOT raise without checking memory; total-batch-size is held
-          #   at 524288 so grad accumulation absorbs the difference.
-          # - same low reconditioning LRs and short warmup; no warmdown by
-          #   default — anneal in a finishing launch via extra_args
-          #   (e.g. --warmdown-ratio=0.25 --final-lr-frac=0.1), last-wins.
+          # Identical to the d32ft AMAP reconditioning recipe except the
+          # operator corner: alpha=1 beta=1 (CMAP) instead of alpha=0 (AMAP).
+          # Eager path: device-batch-size=4 is the validated d32 footprint.
           VARIANT_ARGS: >-
             --attn-variant=hmap
             --hmap-alpha=1.0
             --hmap-beta=1.0
-            --window-pattern=L
             --device-batch-size=4
             --total-batch-size=524288
             --embedding-lr=0.03
@@ -143,7 +132,7 @@ jobs:
           import modal
           import os
 
-          f = modal.Function.from_name("nanochat-regraft2cmap", "train_regraft2cmap")
+          f = modal.Function.from_name("nanochat-d32ft", "train_d32ft")
 
           num_gpus = int(os.environ["NUM_GPUS"])
           gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
@@ -158,9 +147,6 @@ jobs:
               run_tag=os.environ["RUN_TAG"],
               num_gpus=num_gpus,
               resume=os.environ["RESUME"],
-              seed_repo=os.environ["SEED_REPO"],
-              seed_run_tag=os.environ["SEED_RUN_TAG"],
-              seed_step=int(os.environ["SEED_STEP"]),
               add_steps=int(os.environ["ADD_STEPS"]),
               save_every=int(os.environ["SAVE_EVERY"]),
               data_shards=int(os.environ["DATA_SHARDS"]),
