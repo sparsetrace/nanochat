@@ -1,0 +1,97 @@
+# .github/workflows/amap2nanochat-upload.yml
+# Recovery / stage-out: push the amap2nanochat run's checkpoints + logs from
+# the Modal Volume to Hugging Face, without touching a GPU.
+#
+# Use when the training container's final HF push failed (e.g. the 403 on a
+# private-repo LFS quota) but the Volume commit succeeded — the Volume is the
+# source of truth; this just re-runs the mirror step on a cheap CPU worker.
+#
+# Calls the already-defined upload_artifacts function in amap2nanochat.py.
+# The deploy step makes sure the deployed app matches the checked-out code.
+#
+# NOTE: after a successful push, upload_artifacts prunes superseded checkpoint
+# steps from the Volume (keeps the newest keep_last_steps). Set
+# keep_last_steps=0 to disable pruning entirely.
+name: Upload amap2nanochat artifacts to HF
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run/checkpoint identity on the Volume (base_checkpoints/<run_tag>/)"
+        required: false
+        default: "amap2nanochat"
+
+      hf_repo:
+        description: "Destination HF repo"
+        required: false
+        default: "sparsetrace/amap2nanochat"
+
+      horizon:
+        description: "Final step of the run (used only in the commit message)"
+        required: false
+        default: "1000"
+
+      keep_last_steps:
+        description: "Volume checkpoint steps to KEEP after a successful push (0 = keep all, no pruning)"
+        required: false
+        default: "1"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy amap2nanochat app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy amap2nanochat.py
+
+      - name: Push Volume artifacts to HF
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: ${{ inputs.hf_repo }}
+          RUN_TAG: ${{ inputs.run_tag }}
+          HORIZON: ${{ inputs.horizon }}
+          KEEP_LAST_STEPS: ${{ inputs.keep_last_steps }}
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-amap2nanochat", "upload_artifacts")
+
+          # .remote() (not .spawn()): the upload is minutes on a CPU worker,
+          # so block and surface success/failure in the Actions log. A 403
+          # here fails the workflow visibly instead of dying detached.
+          result = f.remote(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              horizon=int(os.environ["HORIZON"]),
+              keep_last_steps=int(os.environ["KEEP_LAST_STEPS"]),
+          )
+
+          print("upload result:", result)
+          assert result.get("ok"), f"upload_artifacts reported failure: {result}"
+          uploaded = result.get("uploaded", 0)
+          assert uploaded > 0, (
+              "0 files uploaded — nothing found on the Volume under "
+              f"base_checkpoints/{os.environ['RUN_TAG']}/ or logs/. "
+              "Check run_tag."
+          )
+          PY
