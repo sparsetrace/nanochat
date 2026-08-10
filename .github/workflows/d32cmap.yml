@@ -44,9 +44,16 @@ on:
         default: "auto"
 
       num_gpus:
-        description: "H100 count"
+        description: "GPU count (4 schedules much faster than 8; total batch is held fixed via grad accum)"
         required: false
         default: "8"
+
+      gpu_type:
+        description: "GPU type (H200: same Hopper arch, 141GB, often better availability)"
+        type: choice
+        options: [H100, H200]
+        required: false
+        default: "H100"
 
       add_steps:
         description: "NEW steps this launch (AMAP arm ran 1600 + 1400 anneal = 3000 total)"
@@ -100,6 +107,7 @@ jobs:
           HF_REPO: sparsetrace/d32cmap
           RUN_TAG: ${{ inputs.run_tag }}
           NUM_GPUS: ${{ inputs.num_gpus }}
+          GPU_TYPE: ${{ inputs.gpu_type }}
           RESUME: ${{ inputs.resume }}
           ADD_STEPS: ${{ inputs.add_steps }}
           SAVE_EVERY: ${{ inputs.save_every }}
@@ -135,7 +143,8 @@ jobs:
           f = modal.Function.from_name("nanochat-d32ft", "train_d32ft")
 
           num_gpus = int(os.environ["NUM_GPUS"])
-          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
+          gpu_type = os.environ.get("GPU_TYPE", "H100")
+          gpu_request = gpu_type if num_gpus == 1 else f"{gpu_type}:{num_gpus}"
           extra = (
               os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
           ).strip()
