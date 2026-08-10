@@ -121,7 +121,7 @@ jobs:
             --attn-variant=hmap
             --hmap-alpha=1.0
             --hmap-beta=1.0
-            --device-batch-size=4
+            --device-batch-size=2
             --total-batch-size=524288
             --embedding-lr=0.03
             --unembedding-lr=0.0008
