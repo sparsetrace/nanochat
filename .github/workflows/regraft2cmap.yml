@@ -1,0 +1,171 @@
+# .github/workflows/regraft2cmap.yml
+# CMAP graft: warm-start a depth-32 nanochat with the regrafted standard-
+# attention weights from sparsetrace/amap2nanochat, then continue pretraining
+# under CMAP — the indefinite-kinetic + Doob corner of the operator square:
+#
+#   (beta, alpha):  (0,0)=AMAP  (0,1)=DMAP  (1,0)=standard  (1,1)=CMAP
+#
+# Lineage: karpathy d32 -> d32ft (AMAP) -> amap2nanochat (standard) -> CMAP.
+#
+# PREREQUISITES on the fork (the harness hard-fails without them):
+#   - nanochat/gpt.py patched via apply_cmap_patch.py (adds hmap_beta)
+#   - scripts/base_train.py exposes --hmap-beta wired into GPTConfig,
+#     mirroring the existing --hmap-alpha plumbing
+#
+# Deploys regraft2cmap.py and spawns train_regraft2cmap. First launch
+# bootstraps from the regrafted checkpoint (Volume-first, HF fallback);
+# relaunches resume this run's own model+optimizer+loop state.
+name: Regraft -> CMAP (indefinite kinetic + Doob)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run/checkpoint identity for THIS experiment"
+        required: false
+        default: "regraft2cmap"
+
+      resume:
+        description: "auto=resume own ckpt if any, else bootstrap from regrafted seed; never=always bootstrap; force=require own ckpt"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
+        required: false
+        default: "auto"
+
+      seed_run_tag:
+        description: "Regrafted run whose checkpoint seeds this graft"
+        required: false
+        default: "amap2nanochat"
+
+      seed_step:
+        description: "Regrafted checkpoint step to seed from (-1 = newest)"
+        required: false
+        default: "-1"
+
+      num_gpus:
+        description: "H100 count"
+        required: false
+        default: "8"
+
+      add_steps:
+        description: "NEW steps this launch (additive to any resumed step)"
+        required: false
+        default: "1000"
+
+      save_every:
+        description: "Checkpoint every N steps"
+        required: false
+        default: "250"
+
+      data_shards:
+        description: "nanochat base-data shards to ensure downloaded"
+        required: false
+        default: "240"
+
+      extra_args:
+        description: "Extra base_train args (last-wins over VARIANT_ARGS below)"
+        required: false
+        default: ""
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy regraft2cmap app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy regraft2cmap.py
+
+      - name: Spawn regraft -> CMAP training
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: sparsetrace/regraft2cmap
+          SEED_REPO: sparsetrace/amap2nanochat
+          RUN_TAG: ${{ inputs.run_tag }}
+          SEED_RUN_TAG: ${{ inputs.seed_run_tag }}
+          SEED_STEP: ${{ inputs.seed_step }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
+          SAVE_EVERY: ${{ inputs.save_every }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+
+          # CMAP recipe (reconditioning-style, mirroring d32ft/a2n):
+          # - hmap alpha=1 beta=1: indefinite kinetic + Doob (CMAP corner).
+          # - window-pattern=L: full causal context, matching the lineage.
+          # - device-batch-size=4: eager T^2 logits are back — this is the
+          #   empirically validated d32-eager footprint from the AMAP runs.
+          #   Do NOT raise without checking memory; total-batch-size is held
+          #   at 524288 so grad accumulation absorbs the difference.
+          # - same low reconditioning LRs and short warmup; no warmdown by
+          #   default — anneal in a finishing launch via extra_args
+          #   (e.g. --warmdown-ratio=0.25 --final-lr-frac=0.1), last-wins.
+          VARIANT_ARGS: >-
+            --attn-variant=hmap
+            --hmap-alpha=1.0
+            --hmap-beta=1.0
+            --window-pattern=L
+            --device-batch-size=4
+            --total-batch-size=524288
+            --embedding-lr=0.03
+            --unembedding-lr=0.0008
+            --matrix-lr=0.002
+            --scalar-lr=0.05
+            --weight-decay=0.0
+            --warmup-steps=40
+            --warmdown-ratio=0.0
+            --final-lr-frac=1.0
+            --core-metric-every=-1
+            --eval-every=100
+            --sample-every=250
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-regraft2cmap", "train_regraft2cmap")
+
+          num_gpus = int(os.environ["NUM_GPUS"])
+          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
+          extra = (
+              os.environ["VARIANT_ARGS"] + " " + os.environ["EXTRA_ARGS"]
+          ).strip()
+
+          f = f.with_options(gpu=gpu_request)
+
+          call = f.spawn(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              num_gpus=num_gpus,
+              resume=os.environ["RESUME"],
+              seed_repo=os.environ["SEED_REPO"],
+              seed_run_tag=os.environ["SEED_RUN_TAG"],
+              seed_step=int(os.environ["SEED_STEP"]),
+              add_steps=int(os.environ["ADD_STEPS"]),
+              save_every=int(os.environ["SAVE_EVERY"]),
+              data_shards=int(os.environ["DATA_SHARDS"]),
+              extra_args=extra,
+          )
+
+          print("launched, call id:", call.object_id)
+          PY
