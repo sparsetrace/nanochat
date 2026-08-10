@@ -1,0 +1,84 @@
+# .github/workflows/hf-visibility.yml
+# Flip a Hugging Face repo between private and public via the API, using the
+# same HF_TOKEN secret as the training/upload workflows. Useful when the web
+# UI won't cooperate (org-role quirks, quota banners) — and as the required
+# pre-step before re-running an upload that 403'd on a private-repo LFS quota.
+#
+# Requirements on HF_TOKEN: for a CLASSIC token, "write" suffices. For a
+# FINE-GRAINED token, it must include repo-settings/admin permission on the
+# target namespace — a write-only fine-grained token can push files but NOT
+# change visibility, and this workflow will fail with 403 (that failure then
+# tells you it's the token, not the repo).
+name: HF repo visibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "HF repo id (namespace/name)"
+        required: false
+        default: "sparsetrace/d32cmap"
+      repo_type:
+        description: "Repo type"
+        type: choice
+        options: [model, dataset]
+        required: false
+        default: "model"
+      visibility:
+        description: "Target visibility"
+        type: choice
+        options: [public, private]
+        required: false
+        default: "public"
+
+jobs:
+  set-visibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install huggingface_hub
+        run: pip install -U huggingface_hub
+
+      - name: Set visibility
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          REPO_TYPE: ${{ inputs.repo_type }}
+          VIS: ${{ inputs.visibility }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          repo = os.environ["REPO"]
+          repo_type = os.environ["REPO_TYPE"]
+          want_private = os.environ["VIS"] == "private"
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          info = api.repo_info(repo, repo_type=repo_type)
+          print(f"before: {repo} private={info.private}")
+          if info.private == want_private:
+              print("already at target visibility — nothing to do")
+              raise SystemExit(0)
+
+          # update_repo_settings is current; update_repo_visibility is the
+          # older API — support both so the hub version doesn't matter.
+          try:
+              api.update_repo_settings(repo_id=repo, repo_type=repo_type,
+                                       private=want_private)
+          except (AttributeError, TypeError):
+              api.update_repo_visibility(repo_id=repo, repo_type=repo_type,
+                                         private=want_private)
+
+          info = api.repo_info(repo, repo_type=repo_type)
+          print(f"after:  {repo} private={info.private}")
+          assert info.private == want_private, \
+              "visibility did not change — token likely lacks settings/admin rights on this namespace"
+          print(f"OK: {repo} is now {'private' if want_private else 'PUBLIC'}")
+          PY
