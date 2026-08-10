@@ -1,0 +1,92 @@
+# .github/workflows/d32ft-upload.yml
+# Recovery / stage-out for any d32ft-family run (d32ft-amap, d32cmap, ...):
+# push the run's checkpoints + logs from the Modal Volume to Hugging Face on
+# a CPU worker, no GPU. Use when the training container's final HF push
+# failed (e.g. 403 on a private-repo LFS quota) but the Volume commit
+# succeeded — the Volume is the source of truth.
+#
+# Before launching for a 403: make the destination repo public (or fix the
+# token's write scope) — the harness auto-creates push repos as PRIVATE, and
+# private-repo LFS storage quotas are the usual cause.
+name: Upload d32ft-family artifacts to HF
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run identity on the Volume (base_checkpoints/<run_tag>/)"
+        required: false
+        default: "d32cmap"
+
+      hf_repo:
+        description: "Destination HF repo"
+        required: false
+        default: "sparsetrace/d32cmap"
+
+      horizon:
+        description: "Final step of the run (commit message only)"
+        required: false
+        default: "1500"
+
+      keep_last_steps:
+        description: "Volume checkpoint steps to KEEP after a successful push (0 = keep all, no pruning)"
+        required: false
+        default: "0"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy d32ft app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy modal_d32ft.py
+
+      - name: Push Volume artifacts to HF
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: ${{ inputs.hf_repo }}
+          RUN_TAG: ${{ inputs.run_tag }}
+          HORIZON: ${{ inputs.horizon }}
+          KEEP_LAST_STEPS: ${{ inputs.keep_last_steps }}
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name("nanochat-d32ft", "upload_artifacts")
+
+          # Blocking .remote(): the upload is minutes on a CPU worker — a 403
+          # fails the workflow visibly instead of dying detached.
+          result = f.remote(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              horizon=int(os.environ["HORIZON"]),
+              keep_last_steps=int(os.environ["KEEP_LAST_STEPS"]),
+          )
+
+          print("upload result:", result)
+          assert result.get("ok"), f"upload_artifacts reported failure: {result}"
+          uploaded = result.get("uploaded", 0)
+          assert uploaded > 0, (
+              "0 files uploaded — nothing found on the Volume under "
+              f"base_checkpoints/{os.environ['RUN_TAG']}/ or logs/. "
+              "Check run_tag."
+          )
+          PY
