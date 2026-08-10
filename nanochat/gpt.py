@@ -29,6 +29,15 @@ m = (q + k)/sqrt(2) the kinetic vectors (metric generator W_M = (W_Q+W_K)/sqrt(2
     alpha = 1  ->  DMAP face (kinetic + Doob)
     0 < alpha < 1 -> homotopy between the curl-only and gradient-only faces.
 
+    beta (hmap_beta) restores the NSD kinetic part -beta/2 <n_i, n_j> with
+    n = (q - k)/sqrt(2), i.e. the full indefinite symmetric kernel
+    W_S = 1/2 W_M W_M^T - 1/2 W_N W_N^T at beta=1. The square:
+    (beta,alpha) = (0,0) AMAP, (0,1) DMAP, (1,0) standard attention
+    (reproduced exactly in the eager branch), (1,1) CMAP
+    (indefinite kinetic + Doob). g is unchanged: diag(R W R^T) sees only
+    the symmetric sector, so g_i = <q_i,k_i> = 1/2||m_i||^2 - 1/2||n_i||^2
+    is already the indefinite potential.
+
 The exact coboundary 1/2 (g_i - g_j) collapses under (masked) row-softmax to the
 per-key Doob tilt -alpha/2 g_j: g_i is row-constant so it washes out; the causal
 mask removes columns, not row-constancy, so the collapse survives causality.
@@ -83,6 +92,10 @@ class GPTConfig:
     attn_variant: str = "standard"
     # HMAP homotopy coordinate: 0 = AMAP (kinetic+flux), 1 = DMAP face (kinetic+Doob).
     hmap_alpha: float = 0.0
+    # Kinetic signature coordinate: 0 = PSD kinetic (1/2 W_M W_M^T only),
+    # 1 = full indefinite symmetric kernel W_S = 1/2 W_M W_M^T - 1/2 W_N W_N^T.
+    # (beta, alpha): (0,0)=AMAP, (0,1)=DMAP, (1,0)=standard (eager), (1,1)=CMAP.
+    hmap_beta: float = 0.0
     # Independent Witten potential diag(R W_W R^T) added to the exact sector.
     # Adds two Linear projections per attention block (parameter count changes).
     witten: bool = False
@@ -128,6 +141,7 @@ class CausalSelfAttention(nn.Module):
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.attn_variant = config.attn_variant
         self.hmap_alpha = config.hmap_alpha
+        self.hmap_beta = config.hmap_beta
         self.witten = config.witten
         self.bidirectional = config.bidirectional
         if self.attn_variant == "hmap":
@@ -137,6 +151,7 @@ class CausalSelfAttention(nn.Module):
             assert config.n_kv_head == config.n_head, \
                 "attn_variant='hmap' requires n_kv_head == n_head (no GQA)"
             assert 0.0 <= self.hmap_alpha <= 1.0, f"hmap_alpha in [0,1], got {self.hmap_alpha}"
+            assert 0.0 <= self.hmap_beta <= 1.0, f"hmap_beta in [0,1], got {self.hmap_beta}"
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -228,12 +243,18 @@ class CausalSelfAttention(nn.Module):
                     "attn_variant='hmap' does not support kv-cache inference yet. "
                     "Training and naive generate() work.")
             a = self.hmap_alpha
+            b = self.hmap_beta
             qh = q.transpose(1, 2)   # (B, H, T, D)
             kh = k.transpose(1, 2)
             vh = v.transpose(1, 2)
 
-            # Kinetic sector vectors and (optional) node potential
+            # Kinetic sector vectors and (optional) node potential.
+            # b > 0 adds the NSD kinetic part: 1/2<m,m> - b*1/2<n,n>, which at
+            # b=1 is the indefinite symmetric kernel x_i^T W_S x_j. g needs no
+            # change: g_i = <q_i,k_i> = 1/2||m_i||^2 - 1/2||n_i||^2 is already
+            # the indefinite potential (diag sees only the symmetric sector).
             m = (qh + kh) * (0.5 ** 0.5)
+            n = (qh - kh) * (0.5 ** 0.5) if b > 0.0 else None
             g = None
             if a > 0.0:
                 g = (qh * kh).sum(-1)                              # (B,H,T)
@@ -246,10 +267,14 @@ class CausalSelfAttention(nn.Module):
             scale = self.head_dim ** -0.5
             mask = self._get_eager_mask(T, window_size, x.device)   # (T,T)
 
-            def _hmap_block(q_blk, k_blk, m_blk, g_blk, rows):
+            def _hmap_block(q_blk, k_blk, m_blk, n_blk, g_blk, rows):
                 """Attention output for a block of query rows against all keys.
-                logits = 1/2<m,m> + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)."""
+                logits = 1/2<m,m> - b*1/2<n,n>
+                       + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)
+                (b,a): (0,0)=AMAP, (0,1)=DMAP, (1,0)=standard, (1,1)=CMAP."""
                 logits = 0.5 * (m_blk @ m.transpose(-2, -1))        # kinetic Gram rows
+                if b > 0.0:
+                    logits = logits - b * 0.5 * (n_blk @ n.transpose(-2, -1))  # NSD sector
                 if a < 1.0:
                     qk = q_blk @ kh.transpose(-2, -1)
                     kq = k_blk @ qh.transpose(-2, -1)
@@ -261,7 +286,7 @@ class CausalSelfAttention(nn.Module):
 
             if torch.is_grad_enabled():
                 # Training: full (B,H,T,T) logits, identical to the validated path.
-                y = _hmap_block(qh, kh, m, g, slice(0, T))
+                y = _hmap_block(qh, kh, m, n, g, slice(0, T))
             else:
                 # Evaluation (bpb, CORE, generate): chunk query rows so the full
                 # T x T logits never materialize — fixes CORE-eval OOM at d12
@@ -273,6 +298,7 @@ class CausalSelfAttention(nn.Module):
                     rows = slice(s, min(s + chunk, T))
                     outs.append(_hmap_block(
                         qh[..., rows, :], kh[..., rows, :], m[..., rows, :],
+                        n[..., rows, :] if n is not None else None,
                         g[..., rows] if g is not None else None, rows))
                 y = torch.cat(outs, dim=-2)
 
