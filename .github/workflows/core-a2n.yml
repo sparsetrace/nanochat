@@ -1,0 +1,68 @@
+# .github/workflows/core-a2n.yml — CORE capability metric for the reverse-graft
+# section: the regrafted amap2nanochat checkpoint (standard attention, FA3,
+# ~15-30 min) or the AMAP seed it started from (chunked eager eval, budget
+# ~1-2h). Attached run; per-task scores stream into this log, JSON uploads to
+# the amap2nanochat repo under evals/.
+#
+# Third arm of the comparison (original Karpathy d32 = core-d32.yml with
+# source=original; AMAP = core-d32.yml with source=converted, or this file
+# with source=seed — same checkpoint, same eager path, either app works).
+name: CORE eval a2n (regrafted / seed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which model to evaluate"
+        type: choice
+        options:
+          - regrafted
+          - seed
+        required: false
+        default: "regrafted"
+      run_tag:
+        description: "Regrafted run tag on the Volume"
+        required: false
+        default: "amap2nanochat"
+      seed_run_tag:
+        description: "AMAP seed run tag (source=seed only)"
+        required: false
+        default: "d32ft-amap"
+      step:
+        description: "Checkpoint step for the chosen source (-1 = newest available)"
+        required: false
+        default: "-1"
+      max_per_task:
+        description: "CORE examples per task (500 = standard; keep constant across all arms)"
+        required: false
+        default: "500"
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Deploy amap2nanochat app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy amap2nanochat.py
+      - name: Evaluate CORE
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run amap2nanochat.py::core_eval_a2n \
+            --source "${{ inputs.source }}" \
+            --run-tag "${{ inputs.run_tag }}" \
+            --seed-run-tag "${{ inputs.seed_run_tag }}" \
+            --step "${{ inputs.step }}" \
+            --max-per-task "${{ inputs.max_per_task }}"
