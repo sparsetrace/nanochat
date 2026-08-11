@@ -251,7 +251,7 @@ def _install_xi_gpt() -> str:
         "                    _ts, _mix = XI_MIX\n"
         "                    logits = _ts * (logits + _mix * logits.transpose(-2, -1))\n"
         "                if XI_TEMP is not None:\n"
-        "                    logits = logits * XI_TEMP[self.layer_idx].view(1, -1, 1, 1)\n"
+        "                    logits = logits * XI_TEMP[self.layer_idx].to(logits.dtype).view(1, -1, 1, 1)\n"
         + a2,
         1,
     )
