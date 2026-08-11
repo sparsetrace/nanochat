@@ -16,12 +16,18 @@ evaluating the identifiable synthetic induction probe (random half + exact
 repeat) at every point. The scan is PAIRED: one fixed token batch is reused
 across all xi, so curves differ only through the operator.
 
-Two variants per xi (Phase 1b of the strategy):
-  raw   : s_xi as above — flux anneals AND metric coupling heats ((2-xi)/2),
-          the physical anti-attention path
-  comp  : (2/(2-xi)) * s_xi — metric coupling pinned, flux scaled by
-          2*xi/(2-xi); the difference raw-vs-comp isolates the pure
-          temperature (cooling/heating) effect at zero training cost
+Three rays through the two-coupling (c_sym, c_flux) plane (the baseline
+(1,1) sits on all three — free replicates):
+  xi       : (2-t, t)  — the anti-attention diagonal (metric heats AND flux
+             anneals; the physical path)
+  fluxcut  : (1, t)    — pinned metric, flux -> 0. The exact part of the
+             antisymmetric sector washes under row-softmax, so this ray is
+             the FROZEN COEXACT DIAL.
+  symheat  : (c, 1)    — pinned flux, metric coupling 1 -> 2 (temperature /
+             PSD-diagonal self-lock control; c=2 at flux 1 is close to the
+             uniform-doubling point that collapsed frozen induction)
+The xi-cliff is interpretable only against the other two rays: fluxcut vs
+symheat decides whether the collapse is flux loss or metric heating.
 
 The mirror mix is applied INSIDE the eager hmap block BEFORE the causal mask
 (transposing after the mask would drag -inf from the invisible triangle onto
@@ -322,17 +328,36 @@ print(f"[xi-run] hook identity OK | baseline (xi=1.0): "
       f"induction_loss {base[0]:.4f} acc {base[1]:.4f} "
       f"random_half {base[2]:.4f}", flush=True)
 
+def set_couplings(c_sym, c_flux):
+    # hook applies ts * (s + mix * s^T); solve for target (c_sym, c_flux):
+    #   ts*(1+mix) = c_sym,  ts*(1-mix) = c_flux
+    ts = 0.5 * (c_sym + c_flux)
+    mix = 0.0 if ts == 0.0 else (c_sym - c_flux) / (c_sym + c_flux)
+    G.XI_MIX = (ts, mix)
+
+# Three rays through the two-coupling (c_sym, c_flux) plane. (1,1) is the
+# baseline and appears on every ray — free replicates. NOTE c_flux scales the
+# whole antisymmetric sector, but the exact part washes under row-softmax, so
+# the fluxcut ray is the FROZEN COEXACT DIAL at pinned metric coupling.
+points = []
+for i in range(11):
+    t = round(0.1 * i, 1)
+    points.append(("xi", t, 2.0 - t, t))        # anti-attention diagonal
+    points.append(("fluxcut", t, 1.0, t))       # pinned metric, flux -> 0
+for i in range(11):
+    c = round(1.0 + 0.1 * i, 1)
+    points.append(("symheat", c, c, 1.0))       # pinned flux, metric heats
+
 rows = []
-xis = [round(0.1 * i, 1) for i in range(11)]     # 0.0 .. 1.0
-for xi in xis:
-    for variant in ("raw", "comp"):
-        ts = 1.0 if variant == "raw" else 2.0 / (2.0 - xi)
-        G.XI_MIX = (ts, 1.0 - xi)
-        il, acc, rh = evaluate()
-        rows.append(dict(xi=xi, variant=variant, induction_loss=il,
-                         induction_acc=acc, random_half_loss=rh))
-        print(f"[xi-run] xi={xi:.1f} {variant:4s} | induction_loss {il:8.4f} "
-              f"acc {acc:.4f} | random_half {rh:8.4f}", flush=True)
+for path, coord, cs, cf in points:
+    set_couplings(cs, cf)
+    il, acc, rh = evaluate()
+    rows.append(dict(path=path, coord=coord, c_sym=cs, c_flux=cf,
+                     induction_loss=il, induction_acc=acc,
+                     random_half_loss=rh))
+    print(f"[xi-run] {path:8s} t={coord:.1f} (c_sym={cs:.1f}, c_flux={cf:.1f})"
+          f" | induction_loss {il:8.4f} acc {acc:.4f}"
+          f" | random_half {rh:8.4f}", flush=True)
 G.XI_MIX = None
 
 result = {
@@ -433,7 +458,8 @@ def main(
     )
     scan = result.pop("scan")
     print(json.dumps(result, indent=2))
-    print("  xi  | variant | induction_loss  acc     random_half")
+    print("  path     |  t  | (c_sym, c_flux) | induction_loss  acc     random_half")
     for r in scan:
-        print(f" {r['xi']:.1f}  | {r['variant']:5s}   | {r['induction_loss']:12.4f} "
-              f"{r['induction_acc']:.4f}  {r['random_half_loss']:10.4f}")
+        print(f" {r['path']:8s} | {r['coord']:.1f} | ({r['c_sym']:.1f}, {r['c_flux']:.1f})       "
+              f"| {r['induction_loss']:12.4f} {r['induction_acc']:.4f}  "
+              f"{r['random_half_loss']:10.4f}")
