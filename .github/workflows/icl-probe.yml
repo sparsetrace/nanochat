@@ -1,0 +1,65 @@
+# .github/workflows/icl-probe.yml
+# Consistent-probe ICL/induction measurement: loads any checkpoint in the
+# lineage (original Karpathy d32, AMAP, CMAP, regrafted) and runs the ICL +
+# induction probe on the PINNED 240-shard eval set with zero learning rate —
+# the step-0 evals fire on the loaded weights exactly, nothing trains,
+# nothing is checkpointed.
+#
+# Exists because the d32ft finishing anneal used data_shards=60 while every
+# other launch used 240, making its ICL early/late rows (steps 1600-3000)
+# incomparable across arms. Run this once per endpoint so the whole panel
+# sits on one probe:
+#   arm=original   -> the never-measured native d32 baseline
+#   arm=amap       -> the annealed step-3000 AMAP endpoint, re-probed on 240
+#   arm=cmap       -> CMAP endpoints (needs the hmap_beta-patched fork)
+#   arm=regrafted  -> regraft endpoint (already on 240; run for one-probe parity)
+name: ICL probe (pinned 240-shard set)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Which lineage checkpoint to probe"
+        type: choice
+        options: [original, amap, cmap, regrafted]
+        default: amap
+      step:
+        description: "Checkpoint step (-1 = newest available for the arm)"
+        required: false
+        default: "-1"
+      num_gpus:
+        description: "H100 count (1 is fine; probe is eval-only)"
+        required: false
+        default: "1"
+      push_repo:
+        description: "HF repo where the probe JSON + log are archived under probes/"
+        required: false
+        default: "sparsetrace/d32ft"
+      extra_args:
+        description: "Extra base_train args (last-wins; rarely needed)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Run pinned-shard ICL probe
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run icl_probe.py \
+            --arm "${{ inputs.arm }}" \
+            --step "${{ inputs.step }}" \
+            --num-gpus "${{ inputs.num_gpus }}" \
+            --push-repo "${{ inputs.push_repo }}" \
+            --extra-args "${{ inputs.extra_args }}"
