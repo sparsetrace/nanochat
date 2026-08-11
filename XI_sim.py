@@ -29,6 +29,18 @@ Three rays through the two-coupling (c_sym, c_flux) plane (the baseline
 The xi-cliff is interpretable only against the other two rays: fluxcut vs
 symheat decides whether the collapse is flux loss or metric heating.
 
+CALIBRATION RUNG (calib_steps > 0, default 40): at every point, after the
+frozen evaluation, a scalars-only recalibration runs on a HELD-OUT batch —
+Adam on the conditioning parameters (resid/x0 lambdas, smear/backout,
+smear/ve gates) plus fresh per-head logit temperatures, ALL MATRICES FROZEN.
+These parameters can repair sharpness/gain/mixing but cannot re-aim an
+attention edge and cannot move the ratio c_flux/c_sym (both couplings
+multiply parts of the same pre-softmax tensor). Whatever induction the
+calib row recovers over the frozen row was conditioning; whatever it cannot
+recover is not repairable without touching circuits. Scalars are restored
+from the checkpoint before each point — no leakage across points. The
+calibrated BASELINE (1,1) is the control: it should roughly match frozen.
+
 The mirror mix is applied INSIDE the eager hmap block BEFORE the causal mask
 (transposing after the mask would drag -inf from the invisible triangle onto
 visible entries) via an ephemeral copy of gpt.py — the checked-in file is
@@ -223,7 +235,11 @@ def _install_xi_gpt() -> str:
         a1,
         a1 + "\n# xi-scan mirror mix: set to (temp_scale, mix) to apply\n"
              "# s -> temp_scale * (s + mix * s^T) on the pre-mask logits.\n"
-             "XI_MIX = None",
+             "XI_MIX = None\n"
+             "# Calibration temperatures: list of per-layer (H,) tensors\n"
+             "# multiplying the pre-mask logits (trainable during the\n"
+             "# scalars-only calibration rung).\n"
+             "XI_TEMP = None",
         1,
     )
 
@@ -234,6 +250,8 @@ def _install_xi_gpt() -> str:
         "                if XI_MIX is not None:\n"
         "                    _ts, _mix = XI_MIX\n"
         "                    logits = _ts * (logits + _mix * logits.transpose(-2, -1))\n"
+        "                if XI_TEMP is not None:\n"
+        "                    logits = logits * XI_TEMP[self.layer_idx].view(1, -1, 1, 1)\n"
         + a2,
         1,
     )
@@ -296,6 +314,24 @@ if missing:
     print(f"[xi-run] graft-neutralized {len(missing)} vintage-absent params", flush=True)
 model.eval()
 
+# ── Calibration rung: scalars-only recalibration ────────────────────────────
+# Trainable set = conditioning parameters only. These can fix sharpness,
+# gain, and mixing ratios but CANNOT re-aim an attention edge, and CANNOT
+# move the ratio c_flux/c_sym (both couplings multiply parts of the same
+# pre-softmax tensor, and every parameter below rescales that tensor or the
+# residual stream as a whole). Matrices stay frozen.
+for p in model.parameters():
+    p.requires_grad_(False)
+scalar_params = {n: p for n, p in model.named_parameters()
+                 if any(tag in n for tag in
+                        ("resid_lambdas", "x0_lambdas", "smear_lambda",
+                         "backout_lambda", "smear_gate", "ve_gate"))}
+scalar_init = {n: p.detach().clone() for n, p in scalar_params.items()}
+n_scalar = sum(p.numel() for p in scalar_params.values())
+H = int(template["n_head"]); L = int(template["n_layer"])
+print(f"[xi-run] calibration set: {len(scalar_params)} tensors, "
+      f"{n_scalar} scalar params + {L*H} per-head temperatures", flush=True)
+
 B, T = cfg["batch"], cfg["seqlen"]
 V = int(template["vocab_size"])
 half = T // 2
@@ -303,6 +339,44 @@ half = T // 2
 x = torch.randint(0, min(V, 50000), (B, half), device=device)
 idx = torch.cat([x, x], dim=1)
 tgt = idx[:, 1:]
+
+# HELD-OUT calibration batch (different seed, never probed on)
+gen = torch.Generator(device="cpu").manual_seed(cfg["calib_seed"])
+Bc = cfg["calib_batch"]
+xc = torch.randint(0, min(V, 50000), (Bc, half), generator=gen).to(device)
+idx_c = torch.cat([xc, xc], dim=1)
+tgt_c = idx_c[:, 1:]
+
+def calibrate(steps, lr):
+    """Fit scalars + fresh per-head temperatures on the held-out batch at
+    the CURRENT (c_sym, c_flux). Leaves the calibrated state active for the
+    probe evaluation; caller restores afterwards. Returns (first, last) CE."""
+    temps = [torch.ones(H, device=device, requires_grad=True)
+             for _ in range(L)]
+    G.XI_TEMP = temps
+    for p in scalar_params.values():
+        p.requires_grad_(True)
+    opt = torch.optim.Adam(list(scalar_params.values()) + temps, lr=lr)
+    first = last = None
+    for it in range(steps):
+        opt.zero_grad(set_to_none=True)
+        lg_c = model(idx_c)[:, :-1]
+        loss = F.cross_entropy(lg_c.reshape(-1, lg_c.size(-1)),
+                               tgt_c.reshape(-1))
+        loss.backward()
+        opt.step()
+        if it == 0:
+            first = loss.item()
+        last = loss.item()
+    for p in scalar_params.values():
+        p.requires_grad_(False)
+    return first, last
+
+def restore_scalars():
+    with torch.no_grad():
+        for n, p in scalar_params.items():
+            p.copy_(scalar_init[n])
+    G.XI_TEMP = None
 
 def evaluate():
     # grad ENABLED so the hmap branch takes the full (B,H,T,T) path where the
@@ -348,17 +422,33 @@ for i in range(11):
     c = round(1.0 + 0.1 * i, 1)
     points.append(("symheat", c, c, 1.0))       # pinned flux, metric heats
 
+calib_steps = int(cfg["calib_steps"])
+calib_lr = float(cfg["calib_lr"])
 rows = []
 for path, coord, cs, cf in points:
     set_couplings(cs, cf)
     il, acc, rh = evaluate()
     rows.append(dict(path=path, coord=coord, c_sym=cs, c_flux=cf,
-                     induction_loss=il, induction_acc=acc,
-                     random_half_loss=rh))
+                     variant="frozen", induction_loss=il, induction_acc=acc,
+                     random_half_loss=rh, calib_ce_first=None,
+                     calib_ce_last=None))
     print(f"[xi-run] {path:8s} t={coord:.1f} (c_sym={cs:.1f}, c_flux={cf:.1f})"
-          f" | induction_loss {il:8.4f} acc {acc:.4f}"
+          f" frozen | induction_loss {il:8.4f} acc {acc:.4f}"
           f" | random_half {rh:8.4f}", flush=True)
+    if calib_steps > 0:
+        c0, c1 = calibrate(calib_steps, calib_lr)
+        il2, acc2, rh2 = evaluate()
+        rows.append(dict(path=path, coord=coord, c_sym=cs, c_flux=cf,
+                         variant="calib", induction_loss=il2,
+                         induction_acc=acc2, random_half_loss=rh2,
+                         calib_ce_first=c0, calib_ce_last=c1))
+        print(f"[xi-run] {path:8s} t={coord:.1f} (c_sym={cs:.1f}, "
+              f"c_flux={cf:.1f}) calib  | induction_loss {il2:8.4f} "
+              f"acc {acc2:.4f} | random_half {rh2:8.4f} "
+              f"| calib CE {c0:.3f}->{c1:.3f}", flush=True)
+        restore_scalars()
 G.XI_MIX = None
+G.XI_TEMP = None
 
 result = {
     "arm": cfg["arm"], "origin": cfg["origin"], "checkpoint_step": cfg["step"],
@@ -392,6 +482,10 @@ def run_xi_scan(
     batch: int = 8,
     seqlen: int = 512,
     seed: int = 1234,
+    calib_steps: int = 40,     # 0 disables the calibration rung
+    calib_lr: float = 0.01,
+    calib_batch: int = 4,
+    calib_seed: int = 4321,
     push_repo: str = "sparsetrace/d32ft",
 ) -> dict:
     assert arm in ARMS, f"arm must be one of {sorted(ARMS)}"
@@ -424,6 +518,8 @@ def run_xi_scan(
             "hmap_beta": preset["hmap_beta"],
         },
         "batch": batch, "seqlen": seqlen, "seed": seed,
+        "calib_steps": calib_steps, "calib_lr": calib_lr,
+        "calib_batch": calib_batch, "calib_seed": calib_seed,
         "out_json": str(out_json), "out_csv": str(out_csv),
     }
     (workdir / "job.json").write_text(json.dumps(job))
@@ -450,16 +546,22 @@ def main(
     batch: int = 8,
     seqlen: int = 512,
     seed: int = 1234,
+    calib_steps: int = 40,
+    calib_lr: float = 0.01,
+    calib_batch: int = 4,
+    calib_seed: int = 4321,
     push_repo: str = "sparsetrace/d32ft",
 ):
     result = run_xi_scan.remote(
-        arm=arm, step=step, batch=batch, seqlen=seqlen,
-        seed=seed, push_repo=push_repo,
+        arm=arm, step=step, batch=batch, seqlen=seqlen, seed=seed,
+        calib_steps=calib_steps, calib_lr=calib_lr,
+        calib_batch=calib_batch, calib_seed=calib_seed,
+        push_repo=push_repo,
     )
     scan = result.pop("scan")
     print(json.dumps(result, indent=2))
-    print("  path     |  t  | (c_sym, c_flux) | induction_loss  acc     random_half")
+    print("  path     |  t  | (c_sym, c_flux) | variant | induction_loss  acc     random_half")
     for r in scan:
         print(f" {r['path']:8s} | {r['coord']:.1f} | ({r['c_sym']:.1f}, {r['c_flux']:.1f})       "
-              f"| {r['induction_loss']:12.4f} {r['induction_acc']:.4f}  "
-              f"{r['random_half_loss']:10.4f}")
+              f"| {r['variant']:6s} | {r['induction_loss']:12.4f} "
+              f"{r['induction_acc']:.4f}  {r['random_half_loss']:10.4f}")
