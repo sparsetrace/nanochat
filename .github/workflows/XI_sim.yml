@@ -1,0 +1,72 @@
+# .github/workflows/XI_sim.yml
+# Frozen anti-attention scan: NO training. Loads one lineage checkpoint and
+# sweeps the mirror-mix coordinate
+#
+#     s_xi = s + (1 - xi) * s^T  =  (2 - xi) * sym(s) + xi * A
+#
+#     xi = 1.0  : the checkpoint's own operator (AMAP for the default arm)
+#     xi = 0.0  : pure symmetrized kernel, doubled coupling — bare DMAP
+#
+# from 0.0 to 1.0 in steps of 0.1, evaluating the identifiable synthetic
+# induction probe at every point on ONE paired token batch. Two variants per
+# point: raw (physical anti-attention path: flux anneals AND metric heats)
+# and comp (temperature-compensated: metric coupling pinned) — their
+# difference isolates the pure temperature effect with zero training.
+#
+# One GPU job, minutes; model loaded once. Requires the CMAP-patched fork
+# (hmap_beta) committed on the branch this runs from.
+name: XI scan (frozen anti-attention sweep)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Which checkpoint to sweep"
+        type: choice
+        options: [amap, regrafted, original, cmap]
+        default: amap
+      step:
+        description: "Checkpoint step (-1 = newest available)"
+        required: false
+        default: "-1"
+      batch:
+        description: "Probe batch size"
+        required: false
+        default: "8"
+      seqlen:
+        description: "Probe sequence length (even; half random + half repeat)"
+        required: false
+        default: "512"
+      seed:
+        description: "Probe RNG seed (same seed = same paired batch)"
+        required: false
+        default: "1234"
+      push_repo:
+        description: "HF repo where the scan JSON + CSV are archived under probes/"
+        required: false
+        default: "sparsetrace/d32ft"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Run frozen xi scan
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run XI_sim.py \
+            --arm "${{ inputs.arm }}" \
+            --step "${{ inputs.step }}" \
+            --batch "${{ inputs.batch }}" \
+            --seqlen "${{ inputs.seqlen }}" \
+            --seed "${{ inputs.seed }}" \
+            --push-repo "${{ inputs.push_repo }}"
