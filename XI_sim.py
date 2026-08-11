@@ -18,14 +18,23 @@ across all xi, so curves differ only through the operator.
 
 Three rays through the two-coupling (c_sym, c_flux) plane (the baseline
 (1,1) sits on all three — free replicates):
-  xi       : (2-t, t)  — the anti-attention diagonal (metric heats AND flux
-             anneals; the physical path)
-  fluxcut  : (1, t)    — pinned metric, flux -> 0. The exact part of the
-             antisymmetric sector washes under row-softmax, so this ray is
-             the FROZEN COEXACT DIAL.
-  symheat  : (c, 1)    — pinned flux, metric coupling 1 -> 2 (temperature /
-             PSD-diagonal self-lock control; c=2 at flux 1 is close to the
-             uniform-doubling point that collapsed frozen induction)
+  xi        : (2-t, t)  — the anti-attention diagonal (metric heats AND flux
+              anneals; the physical path)
+  fluxcut   : (1, t)    — pinned metric, flux -> 0. The exact part of the
+              antisymmetric sector washes under row-softmax, so this ray is
+              the FROZEN COEXACT DIAL.
+  symheat   : (c, 1)    — pinned flux, metric coupling 1 -> 2 (temperature /
+              PSD-diagonal self-lock control; c=2 at flux 1 is close to the
+              uniform-doubling point that collapsed frozen induction)
+plus a fourth, extending the master curve past its trained boundary:
+  fluxboost : (1, t), t in (1, 2] — pinned metric, flux OVER-driven (r > 1).
+              Decides whether calibrated induction beyond the trained
+              coupling improves, saturates, or declines — i.e. whether the
+              trained model sits at, below, or above its own optimal
+              relative directed coupling.
+Calibrated accuracies from all rays are expected to collapse onto a master
+curve in the gauge-invariant ratio r = c_flux/c_sym (per-head temperatures
+span the radial/temperature direction, so calibration quotients it out).
 The xi-cliff is interpretable only against the other two rays: fluxcut vs
 symheat decides whether the collapse is flux loss or metric heating.
 
@@ -421,6 +430,10 @@ for i in range(11):
 for i in range(11):
     c = round(1.0 + 0.1 * i, 1)
     points.append(("symheat", c, c, 1.0))       # pinned flux, metric heats
+for i in range(1, 11):
+    t = round(1.0 + 0.1 * i, 1)
+    points.append(("fluxboost", t, 1.0, t))     # pinned metric, flux OVER-driven
+                                                # past its trained value (r > 1)
 
 calib_steps = int(cfg["calib_steps"])
 calib_lr = float(cfg["calib_lr"])
