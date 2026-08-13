@@ -1,0 +1,124 @@
+name: d32 diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "State alias: original, amap1, attention1, amap2"
+        required: false
+        default: "amap2"
+      mode:
+        description: "Diagnostics mode"
+        type: choice
+        options: [all, core, sample, icl]
+        required: false
+        default: "all"
+      repo:
+        description: "Optional HF repo override"
+        required: false
+        default: ""
+      run_tag:
+        description: "Optional run-tag override"
+        required: false
+        default: ""
+      step:
+        description: "Checkpoint step (-1 = newest)"
+        required: false
+        default: "-1"
+      operator_override:
+        description: "Optional fixed-weight operator override"
+        required: false
+        default: ""
+      max_per_task:
+        description: "CORE examples per task"
+        required: false
+        default: "500"
+      num_samples:
+        description: "Samples per prompt"
+        required: false
+        default: "1"
+      max_tokens:
+        description: "Tokens per sample"
+        required: false
+        default: "64"
+      results_repo:
+        description: "HF repo for lightweight results"
+        required: false
+        default: "sparsetrace/DAC-d32-results"
+
+jobs:
+  direct:
+    if: ${{ inputs.mode == 'all' || inputs.mode == 'core' || inputs.mode == 'sample' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Deploy diagnostics
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy diagnostics.py
+      - name: Run CORE / sampling diagnostics
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          MODE="${{ inputs.mode }}"
+          DO_CORE=true
+          DO_SAMPLE=true
+          if [ "$MODE" = "core" ]; then DO_SAMPLE=false; fi
+          if [ "$MODE" = "sample" ]; then DO_CORE=false; fi
+
+          modal run diagnostics.py             --state "${{ inputs.state }}"             --repo "${{ inputs.repo }}"             --run-tag "${{ inputs.run_tag }}"             --step "${{ inputs.step }}"             --operator-override "${{ inputs.operator_override }}"             --do-core "$DO_CORE"             --do-sample "$DO_SAMPLE"             --max-per-task "${{ inputs.max_per_task }}"             --num-samples "${{ inputs.num_samples }}"             --max-tokens "${{ inputs.max_tokens }}"             --results-repo "${{ inputs.results_repo }}"
+
+  icl:
+    if: ${{ inputs.mode == 'all' || inputs.mode == 'icl' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Run pinned 240-shard ICL probe
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          STATE="${{ inputs.state }}"
+          REPO="${{ inputs.repo }}"
+          RUN_TAG="${{ inputs.run_tag }}"
+          ARM="amap"
+          EXTRA=()
+
+          case "$STATE" in
+            original) ARM="original" ;;
+            amap1) ARM="amap" ;;
+            attention1) ARM="regrafted" ;;
+            amap2)
+              ARM="amap"
+              if [ -z "$REPO" ]; then REPO="sparsetrace/nanochat2amap"; fi
+              if [ -z "$RUN_TAG" ]; then RUN_TAG="nanochat2amap"; fi
+              EXTRA+=(--attn-variant hmap --hmap-alpha 0.0 --hmap-beta 0.0)
+              ;;
+          esac
+
+          CMD=(modal run icl_probe.py
+            --arm "$ARM"
+            --step "${{ inputs.step }}"
+            --push-repo "${{ inputs.results_repo }}")
+
+          if [ -n "$REPO" ]; then CMD+=(--repo "$REPO"); fi
+          if [ -n "$RUN_TAG" ]; then CMD+=(--run-tag "$RUN_TAG"); fi
+          CMD+=("${EXTRA[@]}")
+          "${CMD[@]}"
