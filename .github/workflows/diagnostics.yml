@@ -4,11 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       state:
-        description: "Checkpoint alias (original, amap1, attention1, amap2)"
+        description: "Checkpoint alias (d12 series or d32 hysteresis series)"
         required: true
         default: "amap2"
         type: choice
         options:
+          - d12-attention
+          - d12-amap
+          - d12-dmap
           - original
           - amap1
           - attention1
