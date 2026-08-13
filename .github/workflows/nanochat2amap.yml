@@ -1,0 +1,178 @@
+# .github/workflows/nanochat2amap.yml
+# Return graft for the Transformer-hysteresis loop:
+#
+#   d32ft.yml           Std_0  -> AMAP_1
+#   amap2nanochat.yml   AMAP_1 -> Std_1
+#   nanochat2amap.yml   Std_1  -> AMAP_2
+#
+# This workflow warm-starts from the standard-attention checkpoint produced by
+# sparsetrace/amap2nanochat, keeps the parameter vector fixed at the graft,
+# switches only the attention functional back to coupled AMAP (HMAP alpha=0),
+# and then optionally continues pretraining on the same nanochat base-data
+# pipeline. nanochat2amap.py itself pins:
+#
+#   --attn-variant=hmap --hmap-alpha=0 --window-pattern=L
+#
+# so these operator flags must NOT be supplied through EXTRA_ARGS.
+name: nanochat -> AMAP (return graft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tag:
+        description: "Run/checkpoint identity for THIS return-graft experiment"
+        required: false
+        default: "nanochat2amap"
+
+      resume:
+        description: "auto=resume own ckpt if any, else bootstrap from Std_1 seed; never=always bootstrap; force=require own ckpt"
+        type: choice
+        options:
+          - auto
+          - never
+          - force
+        required: false
+        default: "auto"
+
+      seed_run_tag:
+        description: "Reopened standard-attention run whose checkpoint seeds AMAP_2"
+        required: false
+        default: "amap2nanochat"
+
+      seed_step:
+        description: "Std_1 checkpoint step to seed from (-1 = newest)"
+        required: false
+        default: "-1"
+
+      num_gpus:
+        description: "H100 count"
+        required: false
+        default: "8"
+
+      add_steps:
+        description: "NEW AMAP reconditioning steps this launch (additive to any resumed step)"
+        required: false
+        default: "1000"
+
+      save_every:
+        description: "Checkpoint every N steps"
+        required: false
+        default: "250"
+
+      data_shards:
+        description: "nanochat/ClimbMix base-data shards to ensure downloaded"
+        required: false
+        default: "240"
+
+      extra_args:
+        description: "Extra base_train args; do NOT set --attn-variant or --hmap-alpha"
+        required: false
+        default: ""
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy nanochat2amap app
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal deploy nanochat2amap.py
+
+      - name: Spawn standard-attention -> AMAP return graft
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+          HF_REPO: sparsetrace/nanochat2amap
+          SEED_REPO: sparsetrace/amap2nanochat
+          RUN_TAG: ${{ inputs.run_tag }}
+          SEED_RUN_TAG: ${{ inputs.seed_run_tag }}
+          SEED_STEP: ${{ inputs.seed_step }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          RESUME: ${{ inputs.resume }}
+          ADD_STEPS: ${{ inputs.add_steps }}
+          SAVE_EVERY: ${{ inputs.save_every }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+
+          # Return-graft reconditioning recipe.
+          #
+          # The operator itself is pinned inside nanochat2amap.py:
+          #   --attn-variant=hmap --hmap-alpha=0 --window-pattern=L
+          #
+          # Keep AMAP's conservative device batch size because its eager
+          # attention path materializes T^2 logits. The remaining optimizer
+          # settings mirror the earlier d32 AMAP reconditioning leg so that
+          # the return path is directly comparable.
+          TRAIN_ARGS: >-
+            --device-batch-size=4
+            --total-batch-size=524288
+            --embedding-lr=0.03
+            --unembedding-lr=0.0008
+            --matrix-lr=0.002
+            --scalar-lr=0.05
+            --weight-decay=0.0
+            --warmup-steps=40
+            --warmdown-ratio=0.0
+            --final-lr-frac=1.0
+            --core-metric-every=-1
+            --eval-every=100
+            --sample-every=250
+
+        run: |
+          python - <<'PY'
+          import modal
+          import os
+
+          f = modal.Function.from_name(
+              "nanochat-nanochat2amap",
+              "train_nanochat2amap",
+          )
+
+          num_gpus = int(os.environ["NUM_GPUS"])
+          gpu_request = "H100" if num_gpus == 1 else f"H100:{num_gpus}"
+
+          extra = (
+              os.environ["TRAIN_ARGS"] + " " + os.environ["EXTRA_ARGS"]
+          ).strip()
+
+          # nanochat2amap.py intentionally rejects these overrides because the
+          # scientific intervention is specifically Std_1 -> coupled AMAP.
+          forbidden = ("--attn-variant", "--hmap-alpha")
+          bad = [flag for flag in forbidden if flag in extra]
+          if bad:
+              raise SystemExit(
+                  f"Do not override return-graft operator flags via extra_args: {bad}"
+              )
+
+          f = f.with_options(gpu=gpu_request)
+
+          call = f.spawn(
+              hf_repo=os.environ["HF_REPO"],
+              run_tag=os.environ["RUN_TAG"],
+              num_gpus=num_gpus,
+              resume=os.environ["RESUME"],
+              seed_repo=os.environ["SEED_REPO"],
+              seed_run_tag=os.environ["SEED_RUN_TAG"],
+              seed_step=int(os.environ["SEED_STEP"]),
+              add_steps=int(os.environ["ADD_STEPS"]),
+              save_every=int(os.environ["SAVE_EVERY"]),
+              data_shards=int(os.environ["DATA_SHARDS"]),
+              extra_args=extra,
+          )
+
+          print("launched, call id:", call.object_id)
+          PY
