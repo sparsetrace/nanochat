@@ -118,7 +118,7 @@ jobs:
           # settings mirror the earlier d32 AMAP reconditioning leg so that
           # the return path is directly comparable.
           TRAIN_ARGS: >-
-            --device-batch-size=4
+            --device-batch-size=2
             --total-batch-size=524288
             --embedding-lr=0.03
             --unembedding-lr=0.0008
