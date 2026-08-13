@@ -4,134 +4,182 @@ on:
   workflow_dispatch:
     inputs:
       state:
-        description: "State alias: original, amap1, attention1, amap2"
-        required: false
+        description: "Checkpoint alias (original, amap1, attention1, amap2)"
+        required: true
         default: "amap2"
-      mode:
-        description: "Diagnostics mode"
         type: choice
-        options: [all, core, sample, icl]
-        required: false
+        options:
+          - original
+          - amap1
+          - attention1
+          - amap2
+
+      mode:
+        description: "Diagnostics to run"
+        required: true
         default: "all"
+        type: choice
+        options:
+          - all
+          - bpb
+          - icl
+          - core
+          - sample
+
       repo:
-        description: "Optional HF repo override"
+        description: "Optional HF repo override (leave blank to use state alias)"
         required: false
         default: ""
+        type: string
+
       run_tag:
-        description: "Optional run-tag override"
+        description: "Optional run-tag override (leave blank to use state alias)"
         required: false
         default: ""
+        type: string
+
       step:
         description: "Checkpoint step (-1 = newest)"
-        required: false
+        required: true
         default: "-1"
+        type: string
+
       operator_override:
-        description: "Optional fixed-weight operator override"
+        description: "Optional operator override: standard or hmap"
         required: false
         default: ""
+        type: string
+
+      eval_tokens:
+        description: "Validation tokens for direct bpb evaluation"
+        required: true
+        default: "524288"
+        type: string
+
+      icl_num_batches:
+        description: "ICL validation batches (canonical base_train value = 8)"
+        required: true
+        default: "8"
+        type: string
+
+      device_batch_size:
+        description: "Per-device diagnostic microbatch (1 is safe for d32 AMAP/HMAP)"
+        required: true
+        default: "1"
+        type: string
+
       max_per_task:
-        description: "CORE examples per task"
-        required: false
+        description: "Maximum examples per CORE task"
+        required: true
         default: "500"
+        type: string
+
       num_samples:
         description: "Samples per prompt"
-        required: false
+        required: true
         default: "1"
+        type: string
+
       max_tokens:
-        description: "Tokens per sample"
-        required: false
+        description: "Maximum generated tokens per sample"
+        required: true
         default: "64"
+        type: string
+
       results_repo:
-        description: "HF repo for lightweight results"
-        required: false
+        description: "HF results repo"
+        required: true
         default: "sparsetrace/DAC-d32-results"
+        type: string
 
 jobs:
-  direct:
-    if: ${{ inputs.mode == 'all' || inputs.mode == 'core' || inputs.mode == 'sample' }}
+  diagnostics:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 370
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install Modal
-        run: pip install modal
+        run: |
+          python -m pip install --upgrade pip
+          pip install modal
+
       - name: Deploy diagnostics
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: modal deploy diagnostics.py
-      - name: Run CORE / sampling diagnostics
+        run: |
+          modal deploy diagnostics.py
+
+      - name: Run diagnostics
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           MODE="${{ inputs.mode }}"
           FLAGS=()
-        
-          if [ "$MODE" = "core" ]; then
-            FLAGS+=(--no-do-sample)
-          elif [ "$MODE" = "sample" ]; then
-            FLAGS+=(--no-do-core)
-          fi
-        
-          modal run diagnostics.py \
-            --state "${{ inputs.state }}" \
-            --repo "${{ inputs.repo }}" \
-            --run-tag "${{ inputs.run_tag }}" \
-            --step "${{ inputs.step }}" \
-            --operator-override "${{ inputs.operator_override }}" \
-            "${FLAGS[@]}" \
-            --max-per-task "${{ inputs.max_per_task }}" \
-            --num-samples "${{ inputs.num_samples }}" \
-            --max-tokens "${{ inputs.max_tokens }}" \
-            --results-repo "${{ inputs.results_repo }}"
-    
-  icl:
-    if: ${{ inputs.mode == 'all' || inputs.mode == 'icl' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install Modal
-        run: pip install modal
-      - name: Run pinned 240-shard ICL probe
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          STATE="${{ inputs.state }}"
-          REPO="${{ inputs.repo }}"
-          RUN_TAG="${{ inputs.run_tag }}"
-          ARM="amap"
-          EXTRA=()
 
-          case "$STATE" in
-            original) ARM="original" ;;
-            amap1) ARM="amap" ;;
-            attention1) ARM="regrafted" ;;
-            amap2)
-              ARM="amap"
-              if [ -z "$REPO" ]; then REPO="sparsetrace/nanochat2amap"; fi
-              if [ -z "$RUN_TAG" ]; then RUN_TAG="nanochat2amap"; fi
-              EXTRA+=(--attn-variant hmap --hmap-alpha 0.0 --hmap-beta 0.0)
+          case "$MODE" in
+            all)
+              ;;
+            bpb)
+              FLAGS+=(--no-do-icl --no-do-core --no-do-sample)
+              ;;
+            icl)
+              FLAGS+=(--no-do-bpb --no-do-core --no-do-sample)
+              ;;
+            core)
+              FLAGS+=(--no-do-bpb --no-do-icl --no-do-sample)
+              ;;
+            sample)
+              FLAGS+=(--no-do-bpb --no-do-icl --no-do-core)
+              ;;
+            *)
+              echo "Unknown mode: $MODE" >&2
+              exit 2
               ;;
           esac
 
-          CMD=(modal run icl_probe.py
-            --arm "$ARM"
+          CMD=(
+            modal run diagnostics.py
+            --state "${{ inputs.state }}"
             --step "${{ inputs.step }}"
-            --push-repo "${{ inputs.results_repo }}")
+            --eval-tokens "${{ inputs.eval_tokens }}"
+            --icl-num-batches "${{ inputs.icl_num_batches }}"
+            --device-batch-size "${{ inputs.device_batch_size }}"
+            --max-per-task "${{ inputs.max_per_task }}"
+            --num-samples "${{ inputs.num_samples }}"
+            --max-tokens "${{ inputs.max_tokens }}"
+            --results-repo "${{ inputs.results_repo }}"
+          )
 
-          if [ -n "$REPO" ]; then CMD+=(--repo "$REPO"); fi
-          if [ -n "$RUN_TAG" ]; then CMD+=(--run-tag "$RUN_TAG"); fi
-          CMD+=("${EXTRA[@]}")
+          if [ -n "${{ inputs.repo }}" ]; then
+            CMD+=(--repo "${{ inputs.repo }}")
+          fi
+
+          if [ -n "${{ inputs.run_tag }}" ]; then
+            CMD+=(--run-tag "${{ inputs.run_tag }}")
+          fi
+
+          if [ -n "${{ inputs.operator_override }}" ]; then
+            CMD+=(--operator-override "${{ inputs.operator_override }}")
+          fi
+
+          CMD+=("${FLAGS[@]}")
+
+          printf 'Running:'
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
+
           "${CMD[@]}"
