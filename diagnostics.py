@@ -103,6 +103,11 @@ with torch.device("meta"):
     model = GPT(GPTConfig(**mc))
 model.to_empty(device=device)
 
+# Critical: initialize nanochat runtime buffers (e.g. RoPE tables) before
+# checkpoint assignment. The checkpoint replaces trainable parameters, but
+# non-persistent/runtime buffers are not guaranteed to come from state_dict.
+model.init_weights()
+
 state = torch.load(
     cfg["model_path"],
     map_location=device,
