@@ -16,6 +16,27 @@ SOURCE_TOKENIZER = ("tokenizer.pkl", "token_bytes.pt")
 RESULTS_REPO = "sparsetrace/DAC-d32-results"
 
 STATE_ALIASES = {
+    # d12 ab-initio series in sparsetrace/nanochat
+    "d12-attention": dict(
+        repo="sparsetrace/nanochat",
+        run_tag="d12-attention",
+        operator="standard",
+        path_prefix="attention/checkpoints/d12/",
+    ),
+    "d12-amap": dict(
+        repo="sparsetrace/nanochat",
+        run_tag="d12-amap",
+        operator="hmap",
+        path_prefix="AMAP/checkpoints/d12-a00/",
+    ),
+    "d12-dmap": dict(
+        repo="sparsetrace/nanochat",
+        run_tag="d12-dmap",
+        operator="hmap",
+        path_prefix="DMAP/checkpoints/d12-a10/",
+    ),
+
+    # d32 hysteresis series
     "original": dict(repo="karpathy/nanochat-d32", run_tag=None, operator="standard",
                      fixed_model="model_000650.pt", fixed_meta="meta_000650.json"),
     "amap1": dict(repo="sparsetrace/d32ft", run_tag="d32ft-amap", operator="hmap"),
@@ -120,7 +141,13 @@ def resolve_state(api, token: str, state: str, repo: str="", run_tag: str="", st
                     origin=f"volume:{use_run}:step-{use}")
 
     files = list(api.list_repo_files(repo_id=use_repo))
-    for prefix in (f"checkpoints/{use_run}/", "latest/"):
+
+    # Most d32 repos use checkpoints/<run_tag>/, while the d12 ab-initio
+    # series lives in nested folders inside sparsetrace/nanochat.
+    explicit_prefix = preset.get("path_prefix")
+    prefixes = (explicit_prefix,) if explicit_prefix else (f"checkpoints/{use_run}/", "latest/")
+
+    for prefix in prefixes:
         steps = _weights_steps(files, prefix)
         if not steps:
             continue
