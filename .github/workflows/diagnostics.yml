@@ -71,13 +71,26 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           MODE="${{ inputs.mode }}"
-          DO_CORE=true
-          DO_SAMPLE=true
-          if [ "$MODE" = "core" ]; then DO_SAMPLE=false; fi
-          if [ "$MODE" = "sample" ]; then DO_CORE=false; fi
-
-          modal run diagnostics.py             --state "${{ inputs.state }}"             --repo "${{ inputs.repo }}"             --run-tag "${{ inputs.run_tag }}"             --step "${{ inputs.step }}"             --operator-override "${{ inputs.operator_override }}"             --do-core "$DO_CORE"             --do-sample "$DO_SAMPLE"             --max-per-task "${{ inputs.max_per_task }}"             --num-samples "${{ inputs.num_samples }}"             --max-tokens "${{ inputs.max_tokens }}"             --results-repo "${{ inputs.results_repo }}"
-
+          FLAGS=()
+        
+          if [ "$MODE" = "core" ]; then
+            FLAGS+=(--no-do-sample)
+          elif [ "$MODE" = "sample" ]; then
+            FLAGS+=(--no-do-core)
+          fi
+        
+          modal run diagnostics.py \
+            --state "${{ inputs.state }}" \
+            --repo "${{ inputs.repo }}" \
+            --run-tag "${{ inputs.run_tag }}" \
+            --step "${{ inputs.step }}" \
+            --operator-override "${{ inputs.operator_override }}" \
+            "${FLAGS[@]}" \
+            --max-per-task "${{ inputs.max_per_task }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --max-tokens "${{ inputs.max_tokens }}" \
+            --results-repo "${{ inputs.results_repo }}"
+    
   icl:
     if: ${{ inputs.mode == 'all' || inputs.mode == 'icl' }}
     runs-on: ubuntu-latest
