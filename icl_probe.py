@@ -384,7 +384,7 @@ def run_probe(
         f"--save-every=1000000 "
         f"--window-pattern=L "
         f"{variant_flags}"
-        f"--device-batch-size=4 "
+        f"--device-batch-size=1 "
         f"--total-batch-size={num_gpus * 4 * 2048} "
         f"--embedding-lr=0.0 --unembedding-lr=0.0 --matrix-lr=0.0 "
         f"--scalar-lr=0.0 --weight-decay=0.0 "
