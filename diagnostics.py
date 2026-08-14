@@ -78,6 +78,18 @@ cfg = json.load(open(sys.argv[1]))
 meta = json.load(open(cfg["meta_path"]))
 mc = dict(meta["model_config"])
 
+# Backward compatibility for older HMAP checkpoints. Some early d12 metadata
+# serialized newly-added HMAP fields as null/None even though training used the
+# parser defaults. Passing None into the current GPTConfig can poison the HMAP
+# arithmetic and trigger an asynchronous CUDA device-side assert.
+if mc.get("attn_variant") == "hmap":
+    if mc.get("hmap_alpha") is None:
+        mc["hmap_alpha"] = 0.0
+    if mc.get("hmap_beta") is None:
+        mc["hmap_beta"] = 0.0
+    if mc.get("witten") is None:
+        mc["witten"] = False
+
 if cfg.get("operator_override"):
     mc["attn_variant"] = cfg["operator_override"]
 
