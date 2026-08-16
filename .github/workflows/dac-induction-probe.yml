@@ -1,0 +1,85 @@
+# .github/workflows/dac-induction-probe.yml
+#
+# Layer/head-resolved DAC induction-current probe.
+#
+# Reuses nanochat.icl_eval.induction_score exactly on repeated-random [s ; s]
+# sequences, while extracting the antisymmetric score field
+#
+#   A_ij = 0.5 * (q_i.k_j - k_i.q_j) / sqrt(d_head)
+#
+# from the post-RoPE, post-QK-norm q,k vectors at every layer/head. For the
+# existing induction benchmark the task current is supported on
+#
+#   t -> t-L+1,   t=L,...,2L-2.
+#
+# The probe sweeps L and records A on the true induction edges plus a local
+# offset profile (default delta=-2..2). It reports both raw A and the ACTIVE
+# HMAP flux (1-alpha)A; thus CMAP has active flux zero while its latent q,k A
+# can still be inspected.
+#
+# Pure inference. The Modal worker uses one A10G and archives JSON + logs to HF.
+name: DAC induction-current probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Checkpoint lineage to probe"
+        type: choice
+        options: [all, original, amap, cmap, regrafted]
+        default: all
+      step:
+        description: "Checkpoint step (-1 = newest available for each arm)"
+        required: false
+        default: "-1"
+      lengths:
+        description: "Comma-separated repeated-half lengths L (requires 2L-1 <= 2048)"
+        required: false
+        default: "32,64,128,256,512"
+      offsets:
+        description: "Local source offsets around j_ind=t-L+1"
+        required: false
+        default: "-2,-1,0,1,2"
+      batch_size:
+        description: "Synthetic induction batch size (16 matches nanochat default)"
+        required: false
+        default: "16"
+      num_batches:
+        description: "Number of synthetic batches per L (4 matches nanochat default)"
+        required: false
+        default: "4"
+      seed:
+        description: "Synthetic induction seed (1234 matches nanochat default)"
+        required: false
+        default: "1234"
+      push_repo:
+        description: "HF repo for probes/dac_induction/*.json + *.log"
+        required: false
+        default: "sparsetrace/d32ft"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Modal
+        run: pip install modal
+      - name: Run DAC induction-current probe
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          modal run dac_induction_probe.py \
+            --arm "${{ inputs.arm }}" \
+            --step "${{ inputs.step }}" \
+            --lengths "${{ inputs.lengths }}" \
+            --offsets="${{ inputs.offsets }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --num-batches "${{ inputs.num_batches }}" \
+            --seed "${{ inputs.seed }}" \
+            --push-repo "${{ inputs.push_repo }}"
