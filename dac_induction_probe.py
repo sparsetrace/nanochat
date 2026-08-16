@@ -5,9 +5,11 @@ Outer mode (Modal harness):
     modal run dac_induction_probe.py --arm all
     modal run dac_induction_probe.py --arm amap --lengths 64,128,256,512
 
-Runtime mode is launched automatically inside the repo venv. It reuses
-nanochat.icl_eval.induction_score exactly, while forward hooks on c_q/c_k
-measure the antisymmetric DAC score field on the induction current support.
+Runtime mode is launched automatically inside the repo venv. It reproduces nanochat.icl_eval.induction_score exactly at the level of
+synthetic examples and reported metrics, but microbatches the model forwards so
+longer L values do not materialize a batch_size x (2L-1) x vocab fp32 logit
+tensor all at once. Forward hooks on c_q/c_k measure the antisymmetric DAC
+score field on the induction current support.
 
 For repeated-random [s ; s] sequences of half-length L, the existing nanochat
 benchmark scores query rows t=L,...,2L-2. The induction source is
@@ -51,10 +53,10 @@ if _RUNTIME:
     from pathlib import Path
 
     import torch
+    import torch.nn.functional as F
 
     from nanochat.common import COMPUTE_DTYPE
     from nanochat.gpt import GPT, GPTConfig, apply_rotary_emb, norm
-    from nanochat.icl_eval import induction_score
     from nanochat.tokenizer import get_tokenizer
 
 
@@ -63,6 +65,77 @@ if _RUNTIME:
         if not vals:
             raise ValueError("expected at least one integer")
         return vals
+
+
+    @torch.no_grad()
+    def _induction_score_microbatched(
+        model, vocab_size, device, *, seq_len=256, logical_batch_size=16,
+        num_batches=4, seed=1234, micro_batch_size=0,
+    ):
+        """Memory-safe replica of nanochat.icl_eval.induction_score.
+
+        The logical synthetic batches are generated with the same CPU generator,
+        seed, shapes, and ordering as nanochat's benchmark. Only the model forward
+        is split into smaller microbatches. Because every example contributes the
+        same number of scored positions, the final means are identical to averaging
+        the original logical batches (up to harmless kernel-level roundoff from a
+        different physical batch size).
+        """
+        L = int(seq_len)
+        B = int(logical_batch_size)
+        mb = B if micro_batch_size <= 0 else min(B, int(micro_batch_size))
+        g = torch.Generator().manual_seed(seed)
+
+        random_loss_sum = 0.0
+        random_count = 0
+        induction_loss_sum = 0.0
+        induction_count = 0
+        induction_correct = 0
+
+        for _ in range(num_batches):
+            # Generate the full logical batch in one call, exactly as the checked-in
+            # nanochat benchmark does. Microbatch only AFTER sampling so the eval set
+            # is unchanged.
+            s_cpu = torch.randint(0, vocab_size, (B, L), generator=g)
+            for b0 in range(0, B, mb):
+                s = s_cpu[b0:b0 + mb].to(device)
+                seq = torch.cat([s, s], dim=1)
+                x, y = seq[:, :-1], seq[:, 1:]
+                logits = model(x)
+                losses = F.cross_entropy(
+                    logits.transpose(1, 2).float(), y, reduction="none"
+                )
+                preds = logits.argmax(dim=-1)
+
+                r = losses[:, :L - 1]
+                z = losses[:, L:]
+                random_loss_sum += r.double().sum().item()
+                random_count += r.numel()
+                induction_loss_sum += z.double().sum().item()
+                induction_count += z.numel()
+                induction_correct += (preds[:, L:] == y[:, L:]).sum().item()
+
+                del s, seq, x, y, logits, losses, preds, r, z
+
+        return {
+            "random_half_loss": random_loss_sum / max(random_count, 1),
+            "induction_loss": induction_loss_sum / max(induction_count, 1),
+            "induction_acc": induction_correct / max(induction_count, 1),
+            "logical_batch_size": B,
+            "micro_batch_size": mb,
+        }
+
+
+    def _auto_micro_batch_size(logical_batch_size: int, L: int, max_forward_tokens: int) -> int:
+        """Keep B_micro * T near a known-safe activation/logit budget.
+
+        GPT.forward materializes fp32 vocabulary logits of shape (B,T,V), so its
+        dominant memory term scales approximately with B*T. The original probe was
+        observed safe at B=16, L=256 (T=511), hence the default budget of 8192
+        sequence-tokens per forward.
+        """
+        T = 2 * int(L) - 1
+        return max(1, min(int(logical_batch_size), int(max_forward_tokens) // T))
 
 
     def _build_d32_model(
@@ -347,7 +420,12 @@ if _RUNTIME:
         p.add_argument("--context-len", type=int, default=2048)
         p.add_argument("--lengths", default="32,64,128,256,512")
         p.add_argument("--offsets", default="-2,-1,0,1,2")
-        p.add_argument("--batch-size", type=int, default=16)
+        p.add_argument("--batch-size", type=int, default=16,
+                       help="logical synthetic batch size; 16 matches nanochat")
+        p.add_argument("--micro-batch-size", type=int, default=0,
+                       help="physical forward batch (0 = auto from max-forward-tokens)")
+        p.add_argument("--max-forward-tokens", type=int, default=8192,
+                       help="auto microbatch budget: micro_batch*(2L-1) <= this")
         p.add_argument("--num-batches", type=int, default=4)
         p.add_argument("--seed", type=int, default=1234)
         args = p.parse_args()
@@ -402,11 +480,13 @@ if _RUNTIME:
                 "vintage_missing_keys": missing,
             },
             "benchmark": {
-                "generator": "nanochat.icl_eval.induction_score (unchanged)",
+                "generator": "nanochat.icl_eval.induction_score construction + metrics, memory-safe microbatched forwards",
                 "sequence": "[s ; s], s ~ Uniform(vocab)^L",
                 "current_support": "t -> t-L+1 for t=L,...,2L-2",
                 "seed": args.seed,
-                "batch_size": args.batch_size,
+                "logical_batch_size": args.batch_size,
+                "requested_micro_batch_size": args.micro_batch_size,
+                "max_forward_tokens": args.max_forward_tokens,
                 "num_batches": args.num_batches,
                 "lengths": lengths,
                 "offsets": offsets,
@@ -416,18 +496,47 @@ if _RUNTIME:
 
         try:
             for L in lengths:
-                collector.begin(L)
-                with torch.inference_mode():
-                    behavior = induction_score(
-                        model,
-                        vocab_size,
-                        device,
-                        seq_len=L,
-                        batch_size=args.batch_size,
-                        num_batches=args.num_batches,
-                        seed=args.seed,
+                if args.micro_batch_size > 0:
+                    micro_batch = min(args.batch_size, args.micro_batch_size)
+                else:
+                    micro_batch = _auto_micro_batch_size(
+                        args.batch_size, L, args.max_forward_tokens
                     )
-                stats = collector.finish()
+
+                # If a particular CUDA/kernel configuration still exceeds memory,
+                # restart this L from the same seed with half the physical batch.
+                # collector.begin() discards any partial A statistics from the failed
+                # attempt, so retries cannot double-count edges.
+                while True:
+                    collector.begin(L)
+                    try:
+                        with torch.inference_mode():
+                            behavior = _induction_score_microbatched(
+                                model,
+                                vocab_size,
+                                device,
+                                seq_len=L,
+                                logical_batch_size=args.batch_size,
+                                num_batches=args.num_batches,
+                                seed=args.seed,
+                                micro_batch_size=micro_batch,
+                            )
+                        stats = collector.finish()
+                        break
+                    except torch.OutOfMemoryError:
+                        if micro_batch <= 1:
+                            raise
+                        old_mb = micro_batch
+                        micro_batch = max(1, micro_batch // 2)
+                        print(
+                            f"[dac] CUDA OOM at arm={args.arm} L={L} "
+                            f"micro_batch={old_mb}; retrying from scratch with "
+                            f"micro_batch={micro_batch}",
+                            flush=True,
+                        )
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
                 tops = _top_heads(stats)
                 result["by_length"][str(L)] = {
                     "behavior": behavior,
@@ -441,7 +550,8 @@ if _RUNTIME:
                 print(
                     f"[dac] arm={args.arm} L={L} "
                     f"loss={behavior['induction_loss']:.4f} "
-                    f"acc={behavior['induction_acc']:.4f} top={top_txt}",
+                    f"acc={behavior['induction_acc']:.4f} "
+                    f"microB={behavior['micro_batch_size']} top={top_txt}",
                     flush=True,
                 )
                 gc.collect()
@@ -522,7 +632,7 @@ else:
             "OMP_NUM_THREADS": "1",
             "HF_HUB_DISABLE_XET": "1",
             "NANOCHAT_BASE_DIR": CACHE_DIR,
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
             "TORCHINDUCTOR_CACHE_DIR": f"{CACHE_DIR}/inductor_cache",
             "TRITON_CACHE_DIR": f"{CACHE_DIR}/triton_cache",
         })
@@ -670,6 +780,8 @@ else:
         lengths: str = "32,64,128,256,512",
         offsets: str = "-2,-1,0,1,2",
         batch_size: int = 16,
+        micro_batch_size: int = 0,
+        max_forward_tokens: int = 8192,
         num_batches: int = 4,
         seed: int = 1234,
         push_repo: str = "sparsetrace/d32ft",
@@ -720,6 +832,8 @@ else:
                 "--lengths", lengths,
                 f"--offsets={offsets}",
                 "--batch-size", str(batch_size),
+                "--micro-batch-size", str(micro_batch_size),
+                "--max-forward-tokens", str(max_forward_tokens),
                 "--num-batches", str(num_batches),
                 "--seed", str(seed),
             ]
@@ -744,7 +858,9 @@ else:
             "requested_arm": arm,
             "lengths": [int(x) for x in lengths.split(",") if x.strip()],
             "offsets": [int(x) for x in offsets.split(",") if x.strip()],
-            "batch_size": batch_size,
+            "logical_batch_size": batch_size,
+            "micro_batch_size": micro_batch_size,
+            "max_forward_tokens": max_forward_tokens,
             "num_batches": num_batches,
             "seed": seed,
             "arms": all_results,
@@ -773,6 +889,8 @@ else:
         lengths: str = "32,64,128,256,512",
         offsets: str = "-2,-1,0,1,2",
         batch_size: int = 16,
+        micro_batch_size: int = 0,
+        max_forward_tokens: int = 8192,
         num_batches: int = 4,
         seed: int = 1234,
         push_repo: str = "sparsetrace/d32ft",
@@ -783,6 +901,8 @@ else:
             lengths=lengths,
             offsets=offsets,
             batch_size=batch_size,
+            micro_batch_size=micro_batch_size,
+            max_forward_tokens=max_forward_tokens,
             num_batches=num_batches,
             seed=seed,
             push_repo=push_repo,
