@@ -18,6 +18,8 @@
 # can still be inspected.
 #
 # Pure inference. The Modal worker uses one A10G and archives JSON + logs to HF.
+# The logical benchmark batch stays at 16, but long sequences are automatically
+# microbatched inside the Python probe to bound the fp32 vocabulary-logit tensor.
 name: DAC induction-current probe
 
 on:
@@ -44,6 +46,14 @@ on:
         description: "Synthetic induction batch size (16 matches nanochat default)"
         required: false
         default: "16"
+      micro_batch_size:
+        description: "Physical forward batch (0 = auto; logical benchmark batch stays unchanged)"
+        required: false
+        default: "0"
+      max_forward_tokens:
+        description: "Auto microbatch budget: micro_batch*(2L-1) <= this"
+        required: false
+        default: "8192"
       num_batches:
         description: "Number of synthetic batches per L (4 matches nanochat default)"
         required: false
@@ -80,6 +90,8 @@ jobs:
             --lengths "${{ inputs.lengths }}" \
             --offsets="${{ inputs.offsets }}" \
             --batch-size "${{ inputs.batch_size }}" \
+            --micro-batch-size "${{ inputs.micro_batch_size }}" \
+            --max-forward-tokens "${{ inputs.max_forward_tokens }}" \
             --num-batches "${{ inputs.num_batches }}" \
             --seed "${{ inputs.seed }}" \
             --push-repo "${{ inputs.push_repo }}"
